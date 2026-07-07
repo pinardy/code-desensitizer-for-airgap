@@ -130,6 +130,86 @@ Arguments:
 - `--dir`: Directory containing the generated test files
 - `--lang`: Optional override; normally the language is read from `mapping.json`
 
+## Example walkthrough (React)
+
+Suppose the airgapped project contains a sensitive feature called `payroll` with an `Ingredient` domain:
+
+```
+src/
+├── features/payroll/
+│   ├── components/
+│   │   ├── IngredientList.tsx      # entry — imports the files below
+│   │   └── ingredient-row.tsx
+│   ├── hooks/useIngredient.ts
+│   ├── api/ingredientApi.ts
+│   └── types/index.ts
+└── utils/format.ts                  # imported via the @/ alias
+```
+
+**1. Define the mappings** (interactively, or in a `mapping.json`):
+
+```json
+{
+  "package":  [{ "from": "features/payroll", "to": "features/feature1" }],
+  "variable": [{ "from": "Ingredient", "to": "Item" }]
+}
+```
+
+**2. Trace and extract** (language is inferred from the `.tsx` extension):
+
+```bash
+python code_extractor.py trace \
+	--entry src/features/payroll/components/IngredientList.tsx \
+	--src src \
+	--out ./extracted \
+	--mapping mapping.json \
+	--strip-loggers \
+	--test-framework vitest
+```
+
+The tool follows the relative, alias (`@/utils/format`), and barrel (`../types` → `types/index.ts`) imports, skips `react`/`axios` and `./styles.css`, and writes a fully renamed tree — one variable mapping covers every variation automatically:
+
+```
+extracted/
+├── features/feature1/
+│   ├── components/ItemList.tsx      # IngredientList → ItemList
+│   ├── components/item-row.tsx      # ingredient-row → item-row (kebab-case)
+│   ├── hooks/useItem.ts             # useIngredient → useItem (hook compound)
+│   ├── api/itemApi.ts               # ingredientApi → itemApi
+│   └── types/index.ts               # INGREDIENT_LIMIT → ITEM_LIMIT
+├── utils/format.ts
+├── CLAUDE_PROMPT.txt                # ready-made prompt (Vitest + React Testing Library)
+├── mapping.json                     # ← keep these three inside the airgap:
+├── reverse_sanitize.sh              # ← they contain the original names
+└── reverse_sanitize.ps1             # ←
+```
+
+For example, `IngredientList.tsx` comes out as:
+
+```tsx
+import { ItemRow } from './item-row';
+import { useItem } from '../hooks/useItem';
+import { Item } from '../types';
+
+export function ItemList() {
+  const { items, loading } = useItem();
+  ...
+```
+
+**3. Generate tests online.** Carry out only the sanitized source files and `CLAUDE_PROMPT.txt`, paste them into the online assistant, and save the tests it writes (e.g. `ItemList.test.tsx`) under `./generated-tests/features/feature1/components/`.
+
+**4. Reverse inside the airgap** (language is read from `mapping.json`):
+
+```bash
+python code_extractor.py reverse \
+	--mapping ./extracted/mapping.json \
+	--dir ./generated-tests
+```
+
+The test is renamed to `features/payroll/components/IngredientList.test.tsx` and every identifier is restored — `ItemRow` → `IngredientRow`, `useItem` → `useIngredient`, `items` → `ingredients`, `ITEM_LIMIT` → `INGREDIENT_LIMIT` — ready to run against the real code.
+
+The Spring Boot flow is identical, except the entry file is a `.java` class, `--base com.mycompany` bounds the import tracing, and `package` mappings are Java packages (e.g. `com.classified → com.example`).
+
 ## Workflow Summary
 
 1. Run `trace` to extract and sanitize the relevant source code.

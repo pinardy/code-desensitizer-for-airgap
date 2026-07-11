@@ -12,8 +12,10 @@ Usage:
   python code_extractor.py reverse --mapping mapping.json --dir ./generated-tests
   python code_extractor.py         (interactive menu)
 
-Requirements: Python 3.7+, no third-party packages needed.
+Requirements: Python 3.9+, no third-party packages needed.
 """
+
+from __future__ import annotations
 
 import os
 import re
@@ -55,7 +57,7 @@ def fqn_to_relative_path(fqn: str) -> str:
     return fqn.replace(".", os.sep) + ".java"
 
 
-def find_source_file(fqn: str, src_root: Path) -> "Path | None":
+def find_source_file(fqn: str, src_root: Path) -> Path | None:
     """Search src_root for the .java file matching fqn."""
     rel = fqn_to_relative_path(fqn)
     candidate = src_root / rel
@@ -452,7 +454,7 @@ class Renamer:
             return text
         return self._regex.sub(self._lookup, text)
 
-    def apply_count(self, text: str) -> "tuple[str, int]":
+    def apply_count(self, text: str) -> tuple[str, int]:
         """Like apply, but also returns the number of substitutions made."""
         if self._regex is None:
             return text, 0
@@ -646,7 +648,7 @@ def save_mappings(mappings: dict, mapping_file: Path):
     print(green(f"  Mappings saved → {mapping_file}"))
 
 
-def get_language(mapping_dict: dict, cli_flag: "str | None" = None) -> str:
+def get_language(mapping_dict: dict, cli_flag: str | None = None) -> str:
     """Language precedence: explicit CLI flag > mapping.json 'language' > default (spring)."""
     key = cli_flag or mapping_dict.get("language") or DEFAULT_LANG
     return key if key in LANGUAGES else DEFAULT_LANG
@@ -657,7 +659,7 @@ def apply_all_mappings(source: str, mapping_dict: dict) -> str:
     return _cached_renamer(build_content_rules(mapping_dict)).apply(source)
 
 
-def apply_all_mappings_count(source: str, mapping_dict: dict) -> "tuple[str, int]":
+def apply_all_mappings_count(source: str, mapping_dict: dict) -> tuple[str, int]:
     """Like apply_all_mappings, but also returns the substitution count (for dry runs)."""
     return _cached_renamer(build_content_rules(mapping_dict)).apply_count(source)
 
@@ -724,7 +726,7 @@ class StringMaskRegistry:
     section so re-runs never reuse an existing index for a different literal.
     """
 
-    def __init__(self, existing: "dict | None" = None):
+    def __init__(self, existing: dict | None = None):
         self._by_token = dict(existing or {})     # "STR_0" -> '"literal"'
         self._by_literal = {v: k for k, v in self._by_token.items()}
         self._next = 0
@@ -762,7 +764,7 @@ def mask_strings_java(source: str, registry: StringMaskRegistry) -> str:
     return JAVA_STRING_RE.sub(replacer, source)
 
 
-def unmask_strings(text: str, strings: dict) -> "tuple[str, int]":
+def unmask_strings(text: str, strings: dict) -> tuple[str, int]:
     """
     Restore masked literals: any quoted STR_n token ("STR_1", 'STR_1' or `STR_1`,
     regardless of which quote style the original had) becomes the recorded
@@ -930,7 +932,7 @@ def strip_loggers_react(source: str) -> str:
 
 
 def sanitize(source: str, mapping_dict: dict, options: dict, lang: dict,
-             registry: "StringMaskRegistry | None" = None) -> str:
+             registry: StringMaskRegistry | None = None) -> str:
     # Masking runs after renaming, so recorded literals contain sanitized names.
     # Reversal unmasks first, then un-renames — restoring the originals exactly.
     source = apply_all_mappings(source, mapping_dict)
@@ -1270,7 +1272,7 @@ def print_checklist(deps: dict, lang: dict):
 
 
 def write_extracted(deps: dict, mapping_dict: dict, options: dict, out_dir: Path, lang: dict,
-                    registry: "StringMaskRegistry | None" = None):
+                    registry: StringMaskRegistry | None = None):
     out_dir.mkdir(parents=True, exist_ok=True)
     written = 0
     for module_id, info in deps.items():
@@ -1297,131 +1299,29 @@ def write_claude_prompt(deps: dict, out_dir: Path, lang: dict, mapping_dict: dic
     print(green(f"  Prompt template → {prompt_file}"))
 
 
-def write_reversal_script(mapping_dict: dict, out_dir: Path, lang: dict):
-    """Write a platform-aware reversal script for both package and variable mappings."""
-    reversed_maps = reverse_mappings(mapping_dict)
-    pkg_reversed = reversed_maps.get("package", [])
-    var_reversed = reversed_maps.get("variable", [])
-    exts = lang["extensions"]
+def write_reverse_instructions(out_dir: Path):
+    """Emit instructions for reversing sanitization on generated test files."""
+    instructions = f"""How to restore original names in generated test files
+=====================================================
 
-    if len(exts) == 1:
-        find_expr = f'-name "*{exts[0]}"'
-    else:
-        find_expr = "\\( " + " -o ".join(f'-name "*{e}"' for e in exts) + " \\)"
+1. Save the AI-generated tests into a directory, e.g. ./generated-tests/
+2. Preview what will change:
 
-    # Bash version
-    bash_lines = [
-        "#!/usr/bin/env bash",
-        f"# Reverse sanitization mappings on generated test files — {lang['label']}",
-        "",
-        "rename_files() {",
-        "  while IFS= read -r -d '' file; do",
-        "    new_path=\"$file\"",
-    ]
+   python code_extractor.py reverse --mapping {out_dir / 'mapping.json'} --dir ./generated-tests --dry-run
 
-    for m in pkg_reversed:
-        frm = lang["pkg_to_posix"](m["from"])
-        to = lang["pkg_to_posix"](m["to"])
-        bash_lines.append(f'    new_path=$(printf %s "$new_path" | sed "s|{frm}|{to}|g")')
+3. Apply the reversal (a timestamped backup of the directory is created first):
 
-    for m in var_reversed:
-        for pattern, repl in variable_mapping_patterns(m["from"], m["to"]):
-            pat = pattern.replace("/", r"\/")
-            bash_lines.append(f"    new_path=$(printf %s \"$new_path\" | perl -pe 's/{pat}/{repl}/g')")
+   python code_extractor.py reverse --mapping {out_dir / 'mapping.json'} --dir ./generated-tests
 
-    bash_lines.extend([
-        "    if [[ \"$new_path\" != \"$file\" ]]; then",
-        "      mkdir -p \"$(dirname \"$new_path\")\"",
-        "      mv \"$file\" \"$new_path\"",
-        "    fi",
-        f"  done < <(find . {find_expr} -print0)",
-        "}",
-        "",
-        "rename_files",
-        "",
-        f"FILES=$(find . {find_expr})",
-        "",
-    ])
+   Options: --no-backup to skip the backup, --force to re-run on a directory
+   that was already reversed with this mapping.
 
-    if pkg_reversed:
-        bash_lines.append("# Package/path mappings")
-        for m in pkg_reversed:
-            frm = m["from"].replace(".", r"\.").replace("/", r"\/")
-            to  = m["to"].replace(".", r"\.").replace("/", r"\/")
-            bash_lines.append(f'# {m["from"]} → {m["to"]}')
-            # perl -pi is portable across GNU/BSD (sed -i and \b are not)
-            bash_lines.append(f"perl -pi -e 's/{frm}/{to}/g' $FILES")
-        bash_lines.append("")
-
-    if var_reversed:
-        bash_lines.append("# Variable/class name mappings (all case/plural/compound variations)")
-        for m in var_reversed:
-            bash_lines.append(f'# {m["from"]} → {m["to"]}')
-            for pattern, repl in variable_mapping_patterns(m["from"], m["to"]):
-                pat = pattern.replace("/", r"\/")
-                bash_lines.append(f"perl -pi -e 's/{pat}/{repl}/g' $FILES")
-        bash_lines.append("")
-
-    bash_file = out_dir / "reverse_sanitize.sh"
-    bash_file.write_text("\n".join(bash_lines), encoding="utf-8")
-    bash_file.chmod(0o755)
-
-    # PowerShell version
-    if len(exts) == 1:
-        ps_glob = f'Get-ChildItem -Recurse -Filter "*{exts[0]}"'
-    else:
-        ps_glob = "Get-ChildItem -Recurse -File -Include " + ",".join(f"*{e}" for e in exts)
-
-    def ps_path_pairs(m):
-        if lang["key"] == "spring":
-            return [(m["from"].replace(".", os.sep), m["to"].replace(".", os.sep))]
-        pairs = [(m["from"], m["to"])]
-        alt = (m["from"].replace("/", "\\"), m["to"].replace("/", "\\"))
-        if alt != pairs[0]:
-            pairs.append(alt)
-        return pairs
-
-    ps_lines = [f"# Reverse sanitization mappings on generated test files — {lang['label']}", f"$files = {ps_glob}", "foreach ($f in $files) {", "    $newPath = $f.FullName"]
-
-    for m in pkg_reversed:
-        for frm, to in ps_path_pairs(m):
-            ps_lines.append(f'    $newPath = $newPath -creplace [regex]::Escape("{frm}"), "{to}"')
-
-    for m in var_reversed:
-        for pattern, repl in variable_mapping_patterns(m["from"], m["to"]):
-            ps_lines.append(f"    $newPath = $newPath -creplace '{pattern}', '{repl}'")
-    ps_lines.extend([
-        '    if ($newPath -ne $f.FullName) {',
-        '        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $newPath) | Out-Null',
-        '        Move-Item -LiteralPath $f.FullName -Destination $newPath',
-        '    }',
-        '}',
-        f"$files = {ps_glob}",
-        'foreach ($f in $files) {',
-        '    $content = Get-Content $f.FullName -Raw'
-    ])
-
-    if pkg_reversed:
-        ps_lines.append("    # Package/path mappings")
-        for m in pkg_reversed:
-            ps_lines.append(f'    # {m["from"]} → {m["to"]}')
-            ps_lines.append(f'    $content = $content -creplace [regex]::Escape("{m["from"]}"), "{m["to"]}"')
-
-    if var_reversed:
-        ps_lines.append("    # Variable/class name mappings (all case/plural/compound variations)")
-        for m in var_reversed:
-            ps_lines.append(f'    # {m["from"]} → {m["to"]}')
-            for pattern, repl in variable_mapping_patterns(m["from"], m["to"]):
-                ps_lines.append(f"    $content = $content -creplace '{pattern}', '{repl}'")
-
-    ps_lines += ["    Set-Content $f.FullName $content", "}"]
-
-    ps_file = out_dir / "reverse_sanitize.ps1"
-    ps_file.write_text("\n".join(ps_lines), encoding="utf-8")
-
-    print(green(f"  Bash reversal script  → {bash_file}"))
-    print(green(f"  PowerShell reversal   → {ps_file}"))
-
+SECURITY: mapping.json maps sanitized names back to the sensitive originals.
+Keep it inside the airgap — never share it alongside the sanitized files.
+"""
+    instructions_file = out_dir / "REVERSE_INSTRUCTIONS.txt"
+    instructions_file.write_text(instructions, encoding="utf-8")
+    print(green(f"  Reversal instructions → {instructions_file}"))
 
 # ─────────────────────────────────────────────
 #  Interactive menu
@@ -1551,6 +1451,9 @@ def interactive_trace():
         var_mappings = prompt_variable_mappings()
         mapping_dict = {"package": pkg_mappings, "variable": var_mappings}
 
+    for warning in validate_mappings(mapping_dict):
+        print(yellow(f"  [!] {warning}"))
+
     options = prompt_options(lang)
     test_framework = prompt_test_framework(lang)
 
@@ -1578,7 +1481,7 @@ def interactive_trace():
     mapping_dict["strings"] = registry.to_dict()
     final_map = out_dir / "mapping.json"
     save_mappings(mapping_dict, final_map)
-    write_reversal_script(mapping_dict, out_dir, lang)
+    write_reverse_instructions(out_dir)
 
     print()
     print(bold("═══ Done ═══"))
@@ -1640,6 +1543,18 @@ def interactive_menu():
 #  CLI entry point
 # ─────────────────────────────────────────────
 
+def parse_inline_mappings(pairs: list | None, flag: str) -> list:
+    """Parse repeated FROM=TO CLI values into mapping dicts (split on the first '=')."""
+    mappings = []
+    for pair in pairs or []:
+        frm, sep, to = pair.partition("=")
+        if not sep or not frm or not to:
+            print(red(f"Invalid {flag} value: '{pair}' — expected FROM=TO"))
+            sys.exit(1)
+        mappings.append({"from": frm, "to": to})
+    return mappings
+
+
 def cmd_trace(args):
     entry_path = Path(args.entry)
     if not entry_path.exists():
@@ -1657,18 +1572,29 @@ def cmd_trace(args):
     src_root = Path(args.src) if args.src else Path(lang["default_src"])
     out_dir  = Path(args.out)
 
-    mapping_dict = {"package": [], "variable": []}
+    mapping_dict = {"package": [], "variable": [], "strings": {}}
     if args.mapping and Path(args.mapping).exists():
         mapping_dict = load_mappings(Path(args.mapping))
         pkg_count = len(mapping_dict.get("package", []))
         var_count = len(mapping_dict.get("variable", []))
         print(green(f"Loaded {pkg_count} package mapping(s) and {var_count} variable mapping(s) from {args.mapping}"))
 
+    mapping_dict["package"] += parse_inline_mappings(args.map_package, "--map-package")
+    mapping_dict["variable"] += parse_inline_mappings(args.map_var, "--map-var")
+
+    for warning in validate_mappings(mapping_dict):
+        print(yellow(f"[!] {warning}"))
+
+    if args.strip_javadoc or args.strip_loggers:
+        print(yellow("[!] --strip-javadoc and --strip-loggers are deprecated no-ops: "
+                     "doc tags and loggers are now stripped by default "
+                     "(use --keep-doc-tags / --keep-loggers to keep them)."))
+
     options = {
         "strip_comments": not args.keep_comments,
-        "strip_javadoc":  args.strip_javadoc,
+        "strip_javadoc":  not args.keep_doc_tags,
         "mask_strings":   args.mask_strings,
-        "strip_loggers":  args.strip_loggers,
+        "strip_loggers":  not args.keep_loggers,
     }
 
     print(bold(f"Language: {lang['label']}"))
@@ -1677,6 +1603,22 @@ def cmd_trace(args):
     print(green(f"Found {len(deps)} module(s)."))
 
     print_checklist(deps, lang)
+
+    if args.dry_run:
+        print()
+        print(bold("Dry run — planned output:"))
+        for module_id, info in deps.items():
+            if info["path"] is None:
+                print(yellow(f"  Would skip:  {module_id} — source not found"))
+                continue
+            rel_path = lang["output_rel_path"](module_id, mapping_dict)
+            _, count = apply_all_mappings_count(info["source"], mapping_dict)
+            print(f"  Would write: {out_dir / rel_path}  ({count} substitution(s))")
+        print(f"  Would write: {out_dir / 'mapping.json'}")
+        print(f"  Would write: {out_dir / 'CLAUDE_PROMPT.txt'}")
+        print(f"  Would write: {out_dir / 'REVERSE_INSTRUCTIONS.txt'}")
+        print(bold("  No files written (--dry-run)."))
+        return
 
     print()
     print(bold("Writing sanitized files..."))
@@ -1688,7 +1630,7 @@ def cmd_trace(args):
     mapping_dict["strings"] = registry.to_dict()
     final_map = out_dir / "mapping.json"
     save_mappings(mapping_dict, final_map)
-    write_reversal_script(mapping_dict, out_dir, lang)
+    write_reverse_instructions(out_dir)
 
 
 def cmd_reverse(args):
@@ -1706,12 +1648,17 @@ def cmd_reverse(args):
     lang = LANGUAGES[get_language(mapping_dict, args.lang)]
     pkg_count = len(mapping_dict.get("package", []))
     var_count = len(mapping_dict.get("variable", []))
-    print(green(f"Loaded {pkg_count} package mapping(s) and {var_count} variable mapping(s)"))
+    str_count = len(mapping_dict.get("strings", {}))
+    print(green(f"Loaded {pkg_count} package mapping(s), {var_count} variable mapping(s), "
+                f"{str_count} masked string(s)"))
     print(green(f"Language: {lang['label']}"))
-    apply_reversal(target_dir, mapping_dict, lang)
+    apply_reversal(target_dir, mapping_dict, lang,
+                   dry_run=args.dry_run, backup=not args.no_backup, force=args.force)
 
 
 def main():
+    if sys.version_info < (3, 9):
+        sys.exit("code_extractor.py requires Python 3.9+")
     if len(sys.argv) == 1:
         interactive_menu()
         return
@@ -1758,16 +1705,27 @@ Examples:
     t.add_argument("--mapping",        default=None,            help="Path to mapping.json (optional)")
     t.add_argument("--test-framework", choices=["jest", "vitest"], default="jest",
                    help="[react] Test framework for the generated prompt (default: jest)")
+    t.add_argument("--map-package",    action="append", metavar="FROM=TO",
+                   help="Add a package/path mapping inline (repeatable)")
+    t.add_argument("--map-var",        action="append", metavar="FROM=TO",
+                   help="Add a variable/class mapping inline (repeatable)")
+    t.add_argument("--dry-run",        action="store_true",
+                   help="Show what would be written without writing anything")
     t.add_argument("--keep-comments",  action="store_true",     help="Do not strip comments")
-    t.add_argument("--strip-javadoc",  action="store_true",     help="Remove @author/@since tags")
-    t.add_argument("--mask-strings",   action="store_true",     help="Mask string literals")
-    t.add_argument("--strip-loggers",  action="store_true",     help="Remove logger statements")
+    t.add_argument("--keep-doc-tags",  action="store_true",     help="Do not strip @author/@since doc tags")
+    t.add_argument("--keep-loggers",   action="store_true",     help="Do not strip logger statements")
+    t.add_argument("--mask-strings",   action="store_true",     help="Mask string literals (recorded in mapping.json for reversal)")
+    t.add_argument("--strip-javadoc",  action="store_true",     help=argparse.SUPPRESS)  # deprecated no-op (now the default)
+    t.add_argument("--strip-loggers",  action="store_true",     help=argparse.SUPPRESS)  # deprecated no-op (now the default)
 
     r = sub.add_parser("reverse", help="Reverse sanitization mappings on generated test files")
     r.add_argument("--mapping", required=True, help="Path to mapping.json")
     r.add_argument("--dir",     required=True, help="Directory containing generated test files")
     r.add_argument("--lang",    choices=list(LANGUAGES), default=None,
                    help="Override language (default: read from mapping.json)")
+    r.add_argument("--dry-run",   action="store_true", help="Preview changes without writing anything")
+    r.add_argument("--no-backup", action="store_true", help="Skip the automatic backup of the target directory")
+    r.add_argument("--force",     action="store_true", help="Re-run even if this directory was already reversed with this mapping")
 
     args = parser.parse_args()
     if args.command == "trace":

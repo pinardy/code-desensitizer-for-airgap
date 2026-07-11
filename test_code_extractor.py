@@ -8,6 +8,8 @@ from code_extractor import (
     to_kebab_case,
     to_pascal_case,
     to_camel_case,
+    pluralize,
+    singularize,
     generate_name_variations,
 )
 
@@ -60,6 +62,57 @@ def test_to_pascal_case(name, expected):
 ])
 def test_to_camel_case(name, expected):
     assert to_camel_case(name) == expected
+
+
+# ─────────────────────────────────────────────
+#  Pluralize / singularize
+# ─────────────────────────────────────────────
+
+@pytest.mark.parametrize("word,expected", [
+    ("ingredient", "ingredients"),
+    ("Ingredient", "Ingredients"),
+    ("INGREDIENT", "INGREDIENTS"),
+    ("branch", "branches"),
+    ("class", "classes"),
+    ("box", "boxes"),
+    ("category", "categories"),
+    ("day", "days"),
+    ("status", "statuses"),
+    ("Status", "Statuses"),
+    ("STATUS", "STATUSES"),
+    ("child", "children"),
+    ("index", "indices"),
+])
+def test_pluralize(word, expected):
+    assert pluralize(word) == expected
+
+
+@pytest.mark.parametrize("word,expected", [
+    ("ingredients", "ingredient"),
+    ("Ingredients", "Ingredient"),
+    ("INGREDIENTS", "INGREDIENT"),
+    ("branches", "branch"),       # ch/sh precedence bug in the old code
+    ("dishes", "dish"),
+    ("classes", "class"),
+    ("boxes", "box"),
+    ("categories", "category"),
+    ("CATEGORIES", "CATEGORY"),
+    ("statuses", "status"),
+    ("children", "child"),
+    ("indices", "index"),
+    # Guards: these must NOT be truncated
+    ("status", "status"),
+    ("analysis", "analysis"),
+    ("address", "address"),
+    ("branch", "branch"),         # old bug: any ch-ending word lost 2 chars
+])
+def test_singularize(word, expected):
+    assert singularize(word) == expected
+
+
+@pytest.mark.parametrize("word", ["order", "Order", "branch", "category", "status", "child"])
+def test_plural_round_trip(word):
+    assert singularize(pluralize(word)) == word
 
 
 # ─────────────────────────────────────────────

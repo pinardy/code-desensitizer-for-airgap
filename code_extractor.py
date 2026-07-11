@@ -254,49 +254,56 @@ def to_camel_case(name: str) -> str:
     return pascal[0].lower() + pascal[1:] if pascal else pascal
 
 
+# Heuristic identifier plural/singular pairs — this is for generating name
+# variations of code identifiers, not a linguistics library. Unknown words
+# fall through to the simple suffix rules; truly unknown forms stay unchanged.
+IRREGULAR_PLURALS = {
+    "child": "children", "person": "people", "status": "statuses",
+    "index": "indices", "matrix": "matrices", "analysis": "analyses",
+    "criterion": "criteria", "datum": "data",
+}
+IRREGULAR_SINGULARS = {v: k for k, v in IRREGULAR_PLURALS.items()}
+
+
+def _match_case(pattern_word: str, replacement: str) -> str:
+    """Re-apply pattern_word's case shape (UPPER / Capitalized / lower) to replacement."""
+    if pattern_word.isupper():
+        return replacement.upper()
+    if pattern_word[:1].isupper():
+        return replacement.capitalize()
+    return replacement
+
+
 def pluralize(word: str) -> str:
-    """Simple English pluralization"""
-    # Common irregular plurals
-    irregulars = {"ingredient": "ingredients", "service": "services", "type": "types"}
+    """Heuristic English pluralization for identifiers."""
     lower = word.lower()
-    if lower in irregulars:
-        # Preserve case pattern
-        if word.isupper():
-            return irregulars[lower].upper()
-        elif word[0].isupper():
-            return irregulars[lower].capitalize()
-        else:
-            return irregulars[lower]
+    if lower in IRREGULAR_PLURALS:
+        return _match_case(word, IRREGULAR_PLURALS[lower])
+
+    def suffix(s: str) -> str:
+        return s.upper() if word.isupper() else s
 
     # Simple rules
-    if lower.endswith(("s", "ss", "x", "z", "ch", "sh")):
-        return word + "es"
+    if lower.endswith(("s", "x", "z", "ch", "sh")):
+        return word + suffix("es")
     elif lower.endswith("y") and len(word) > 1 and word[-2].lower() not in "aeiou":
-        return word[:-1] + "ies"
+        return word[:-1] + suffix("ies")
     else:
-        return word + "s"
+        return word + suffix("s")
 
 
 def singularize(word: str) -> str:
-    """Simple English singularization"""
-    # Common irregulars
-    irregulars = {"ingredients": "ingredient", "services": "service", "types": "type"}
+    """Heuristic English singularization for identifiers."""
     lower = word.lower()
-    if lower in irregulars:
-        # Preserve case pattern
-        if word.isupper():
-            return irregulars[lower].upper()
-        elif word[0].isupper():
-            return irregulars[lower].capitalize()
-        else:
-            return irregulars[lower]
+    if lower in IRREGULAR_SINGULARS:
+        return _match_case(word, IRREGULAR_SINGULARS[lower])
 
     # Simple rules
     if lower.endswith("ies") and len(word) > 3 and word[-4].lower() not in "aeiou":
-        return word[:-3] + "y"
-    elif lower.endswith("es") and len(word) > 2 and word[-3:-2].lower() in "sxz" or word[-3:].lower() in ("ch", "sh"):
+        return word[:-3] + ("Y" if word.isupper() else "y")
+    elif lower.endswith(("ches", "shes", "xes", "zes", "sses")):
         return word[:-2]
-    elif lower.endswith("s") and len(word) > 1 and not lower.endswith("ss"):
+    elif lower.endswith("s") and len(word) > 1 and not lower.endswith(("ss", "us", "is")):
         return word[:-1]
     else:
         return word

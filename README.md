@@ -18,12 +18,12 @@ We can utilize online AI coding assistants or agents to generate the test cases 
 2. Bring out desensitized source code to internet
 3. Use online AI coding assistants/agents to generate test cases
 4. Bring generated test back into airgap env
-5. Run reverse sanitization script
+5. Run `reverse` to restore the original names
 
 ## Requirements
 
-- Python 3.7 or newer
-- No third-party packages are required
+- Python 3.9 or newer
+- No third-party packages are required (tests use `pytest`)
 
 ## Usage
 
@@ -88,11 +88,16 @@ Arguments:
 - `--src`: Source root directory, defaulting to `src/main/java` (Spring) or `src` (React)
 - `--out`: Output directory for sanitized files, defaulting to `./extracted`
 - `--mapping`: Optional `mapping.json` file to reuse existing mappings
+- `--map-package FROM=TO`: Add a package/path mapping inline (repeatable)
+- `--map-var FROM=TO`: Add a variable/class mapping inline (repeatable)
 - `--test-framework`: (React) `jest` or `vitest` for the generated prompt, defaulting to `jest`
+- `--dry-run`: Show what would be written (with per-file substitution counts) without writing anything
 - `--keep-comments`: Keep comments instead of stripping them
-- `--strip-javadoc`: Remove `@author` and `@since` Javadoc/JSDoc tags
-- `--mask-strings`: Replace string literals with placeholders (import specifiers are never masked)
-- `--strip-loggers`: Remove logger statements (`log.*` for Java, `console.*` for React)
+- `--keep-doc-tags`: Keep `@author` / `@since` Javadoc/JSDoc tags instead of stripping them
+- `--keep-loggers`: Keep logger statements (`log.*` for Java, `console.*` for React) instead of stripping them
+- `--mask-strings`: Replace string literals with `STR_n` placeholders (import specifiers are never masked); the originals are recorded in `mapping.json` and restored by `reverse`
+
+> **Changed defaults:** comments, doc tags, and loggers are now stripped by default on the CLI (matching interactive mode). The old `--strip-javadoc` / `--strip-loggers` flags are accepted as no-ops for backward compatibility.
 
 How dependencies are traced:
 
@@ -102,10 +107,11 @@ How dependencies are traced:
 The trace step writes these artifacts into the output directory:
 
 - Sanitized source files
-- `mapping.json` (includes the project language so `reverse` auto-detects it)
+- `mapping.json` (includes the project language so `reverse` auto-detects it, and — when `--mask-strings` is used — the masked string literals for restoration)
 - `CLAUDE_PROMPT.txt`
-- `reverse_sanitize.sh`
-- `reverse_sanitize.ps1`
+- `REVERSE_INSTRUCTIONS.txt` (the exact `reverse` command to run later)
+
+> **Security note:** `mapping.json` maps the sanitized names back to the sensitive originals. Keep it inside the airgap — never share it alongside the sanitized files. The repository's `.gitignore` excludes `extracted/` and `mapping.json` for this reason.
 
 <img src="assets/spring-extractor-results.png" alt="Extractor results" width="650" />
 
@@ -129,6 +135,15 @@ Arguments:
 - `--mapping`: Path to the saved `mapping.json`
 - `--dir`: Directory containing the generated test files
 - `--lang`: Optional override; normally the language is read from `mapping.json`
+- `--dry-run`: Preview every rename and content change (with substitution and string-restore counts) without writing anything
+- `--no-backup`: Skip the automatic timestamped backup copy of the target directory
+- `--force`: Re-run on a directory that was already reversed with this mapping
+
+Safety behavior:
+
+- Before changing anything, `reverse` copies the whole target directory to `<dir>.backup-<timestamp>` (disable with `--no-backup`).
+- String literals masked by `--mask-strings` are restored first, then names are un-renamed — so sensitive values inside strings come back exactly.
+- A `.code_extractor_reversed.json` marker records the mapping fingerprint; running `reverse` twice with the same mapping is refused (double-applying renames could corrupt names) unless you pass `--force`.
 
 ## Example walkthrough (React)
 
@@ -146,7 +161,7 @@ src/
 └── utils/format.ts                  # imported via the @/ alias
 ```
 
-**1. Define the mappings** (interactively, or in a `mapping.json`):
+**1. Define the mappings** — interactively, in a `mapping.json`, or inline with `--map-package` / `--map-var`:
 
 ```json
 {
@@ -155,7 +170,7 @@ src/
 }
 ```
 
-**2. Trace and extract** (language is inferred from the `.tsx` extension):
+**2. Trace and extract** (language is inferred from the `.tsx` extension; add `--dry-run` first to preview):
 
 ```bash
 python code_extractor.py trace \
@@ -163,7 +178,6 @@ python code_extractor.py trace \
 	--src src \
 	--out ./extracted \
 	--mapping mapping.json \
-	--strip-loggers \
 	--test-framework vitest
 ```
 
@@ -179,9 +193,8 @@ extracted/
 │   └── types/index.ts               # INGREDIENT_LIMIT → ITEM_LIMIT
 ├── utils/format.ts
 ├── CLAUDE_PROMPT.txt                # ready-made prompt (Vitest + React Testing Library)
-├── mapping.json                     # ← keep these three inside the airgap:
-├── reverse_sanitize.sh              # ← they contain the original names
-└── reverse_sanitize.ps1             # ←
+├── REVERSE_INSTRUCTIONS.txt         # the reverse command to run later
+└── mapping.json                     # ← keep inside the airgap: contains the original names
 ```
 
 For example, `IngredientList.tsx` comes out as:
@@ -217,13 +230,37 @@ The Spring Boot flow is identical, except the entry file is a `.java` class, `--
 3. Save the generated tests in a local directory.
 4. Run `reverse` to restore the original names in the generated tests.
 
+## mapping.json schema (v2)
+
+```json
+{
+  "version": 2,
+  "language": "spring",
+  "package":  [{ "from": "com.classified", "to": "com.example" }],
+  "variable": [{ "from": "Ingredient", "to": "Item" }],
+  "strings":  { "STR_0": "\"jdbc:oracle:thin:@prod-db:1521\"" }
+}
+```
+
+- `package`: boundary-aware substitutions — Java packages like `com.classified → com.example`, or React path segments like `features/payroll → features/feature1`. `com.classified` matches inside `com.classified.service` and `"com.classified"`, but never inside `com.classified2`.
+- `variable`: name mappings that automatically cover PascalCase, camelCase, snake_case, UPPER_SNAKE, kebab-case, plural/singular, and compound identifiers such as `IngredientService`, `INGREDIENT_TYPE`, or `ingredient-row.tsx`.
+- `strings`: written by `--mask-strings` — maps each `STR_n` placeholder back to the original literal so `reverse` can restore it (in any quote style the generated tests use).
+- Older formats (a bare list, or a dict without `version`/`strings`) still load and are upgraded on save.
+
 ## Notes
 
-- The extractor traces imports that stay within the provided base package (Spring) or resolve inside the source root (React).
-- `mapping.json` has two mapping lists: `package` (plain substitutions — Java packages like `com.classified → com.example`, or React path segments like `features/payroll → features/feature1`) and `variable` (name mappings that automatically cover PascalCase, camelCase, snake_case, UPPER_SNAKE, kebab-case, plural/singular, and compound identifiers such as `IngredientService`, `INGREDIENT_TYPE`, or `ingredient-row.tsx`).
-- The generated `reverse_sanitize.sh` / `.ps1` scripts apply the same variation-aware reversal as `python code_extractor.py reverse` (the bash script uses `perl`, which is available on virtually all Linux/macOS systems).
+- The extractor traces imports that stay within the provided base package (Spring, dot-bounded so `com.myco` does not capture `com.myco2.*`) or resolve inside the source root (React).
+- All renames are applied in a single pass: replacements are never re-scanned by other mappings, so sanitize and reverse are idempotent and independent of mapping order. Conflicting mapping sets (duplicates, self-maps, one mapping's output overlapping another's input) are reported as warnings before writing.
+- Names are intentionally replaced inside string literals and comments too — a sensitive name must not survive anywhere in the sanitized output.
 - Older `mapping.json` files without a `language` field are treated as Spring Boot.
 - If a source file cannot be located automatically, the script reports it during extraction.
+- Non-UTF-8 source files are read with replacement characters and a loud warning (reversal may not restore such files exactly).
+
+## Development
+
+```bash
+python -m pytest test_code_extractor.py -q
+```
 
 ## Limitations
 
@@ -233,4 +270,5 @@ The Spring Boot flow is identical, except the entry file is a `.java` class, `--
 - **Path aliases**: only a single alias (default `@`) mapping to the source root is supported — tsconfig `paths` entries and monorepo workspace packages (`@myco/ui`) are treated as external and skipped.
 - **Dynamic imports** with non-literal arguments (`import(someVar)`) cannot be resolved.
 - **CSS/asset files** are skipped entirely — CSS class names and asset filenames are not sanitized (except where they appear as strings in the traced source).
-- The PowerShell reversal script is generated but has not been exercised on a live PowerShell.
+- **Java text blocks** (`"""..."""`) and char literals are not masked by `--mask-strings`.
+- **Reversal is heuristic**: if an AI-generated test invents an identifier that happens to collide with a mapping's replacement name, `reverse` will rename it too. Use `--dry-run` to preview; a backup is always taken by default.

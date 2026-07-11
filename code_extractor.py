@@ -1652,8 +1652,10 @@ def cmd_reverse(args):
     print(green(f"Loaded {pkg_count} package mapping(s), {var_count} variable mapping(s), "
                 f"{str_count} masked string(s)"))
     print(green(f"Language: {lang['label']}"))
-    apply_reversal(target_dir, mapping_dict, lang,
-                   dry_run=args.dry_run, backup=not args.no_backup, force=args.force)
+    result = apply_reversal(target_dir, mapping_dict, lang,
+                            dry_run=args.dry_run, backup=not args.no_backup, force=args.force)
+    if any("already reversed" in w for w in result["warnings"]):
+        sys.exit(1)
 
 
 def main():

@@ -399,20 +399,169 @@ def variable_mapping_patterns(from_name: str, to_name: str) -> list:
     return pairs
 
 
+# ─────────────────────────────────────────────
+#  Single-pass substitution engine
+# ─────────────────────────────────────────────
+
+_LOOKAROUND_RE = re.compile(r"\(\?<?[=!][^)]*\)")
+
+
+def _pattern_core_len(pattern: str) -> int:
+    """Length of a pattern's literal core, ignoring zero-width lookarounds."""
+    return len(_LOOKAROUND_RE.sub("", pattern))
+
+
+class Renamer:
+    """
+    Single-pass, order-independent substitution engine.
+
+    All (pattern, replacement) rules are compiled into ONE alternation regex and
+    applied with a single re.sub, so a replacement is never re-scanned by another
+    rule. That makes application idempotent and independent of mapping order —
+    provided no 'to' value collides with another mapping's 'from' variations
+    (validate_mappings warns about that).
+
+    Rules are sorted longest-literal-core-first so that at any position the most
+    specific rule wins (OrderItem beats Order). Replacements are returned from a
+    callback, so they are always literal — '\\' and '$' in names are safe.
+    """
+
+    def __init__(self, rules):
+        self._replacements = {}
+        parts = []
+        seen = set()
+        ordered = sorted(enumerate(rules),
+                         key=lambda t: (-_pattern_core_len(t[1][0]), t[0]))
+        for _, (pattern, replacement) in ordered:
+            if pattern in seen:
+                continue  # first (most specific / earliest) rule wins
+            seen.add(pattern)
+            group = f"g{len(self._replacements)}"
+            self._replacements[group] = replacement
+            parts.append(f"(?P<{group}>{pattern})")
+        self._regex = re.compile("|".join(parts)) if parts else None
+
+    def _lookup(self, match) -> str:
+        return self._replacements[match.lastgroup]
+
+    def apply(self, text: str) -> str:
+        if self._regex is None:
+            return text
+        return self._regex.sub(self._lookup, text)
+
+    def apply_count(self, text: str) -> "tuple[str, int]":
+        """Like apply, but also returns the number of substitutions made."""
+        if self._regex is None:
+            return text, 0
+        count = 0
+
+        def counting_lookup(match):
+            nonlocal count
+            count += 1
+            return self._replacements[match.lastgroup]
+
+        return self._regex.sub(counting_lookup, text), count
+
+
+_RENAMER_CACHE = {}
+
+
+def _cached_renamer(rules: tuple) -> Renamer:
+    renamer = _RENAMER_CACHE.get(rules)
+    if renamer is None:
+        renamer = _RENAMER_CACHE[rules] = Renamer(rules)
+    return renamer
+
+
+def package_mapping_patterns(frm: str, to: str) -> list:
+    """
+    Boundary-guarded pattern for a package / path-segment mapping.
+    '.', '/', quotes and whitespace all count as boundaries, so com.myco still
+    matches inside com.myco.service and "com.myco", but not inside com.myco2.
+    """
+    return [(r"(?<![A-Za-z0-9_])" + re.escape(frm) + r"(?![A-Za-z0-9_])", to)]
+
+
+def build_variable_rules(var_mappings: list) -> tuple:
+    rules = []
+    for m in var_mappings:
+        if m.get("from") and m.get("to"):
+            rules.extend(variable_mapping_patterns(m["from"], m["to"]))
+    return tuple(rules)
+
+
+def build_content_rules(mapping_dict: dict) -> tuple:
+    """Rules for file contents: package mappings + variable mappings.
+
+    Names are intentionally replaced inside strings and comments too — a
+    sensitive name must not survive anywhere in the sanitized output.
+    """
+    rules = []
+    for m in mapping_dict.get("package", []):
+        if m.get("from") and m.get("to"):
+            rules.extend(package_mapping_patterns(m["from"], m["to"]))
+    rules.extend(build_variable_rules(mapping_dict.get("variable", [])))
+    return tuple(rules)
+
+
+def build_path_rules(mapping_dict: dict, lang: dict) -> tuple:
+    """Rules for file paths: language-specific package path variants + variable mappings."""
+    rules = []
+    for m in mapping_dict.get("package", []):
+        if m.get("from") and m.get("to"):
+            for f_variant, t_variant in lang["pkg_path_variants"](m["from"], m["to"]):
+                rules.extend(package_mapping_patterns(f_variant, t_variant))
+    rules.extend(build_variable_rules(mapping_dict.get("variable", [])))
+    return tuple(rules)
+
+
+def validate_mappings(mapping_dict: dict) -> list:
+    """
+    Return human-readable warnings for mapping sets that cannot behave predictably:
+    duplicate 'from' values, from == to, and collisions where one mapping's 'to'
+    would be matched by another mapping's 'from' (the engine never re-scans
+    replacements, so such cascades no longer happen — warn instead).
+    """
+    warnings = []
+    pkg = [m for m in mapping_dict.get("package", []) if m.get("from") and m.get("to")]
+    var = [m for m in mapping_dict.get("variable", []) if m.get("from") and m.get("to")]
+
+    for kind, mappings in (("package", pkg), ("variable", var)):
+        seen = {}
+        for m in mappings:
+            if m["from"] == m["to"]:
+                warnings.append(f"{kind} mapping '{m['from']}' maps to itself")
+            if m["from"] in seen and seen[m["from"]] != m["to"]:
+                warnings.append(f"duplicate {kind} mapping for '{m['from']}' "
+                                f"('{seen[m['from']]}' vs '{m['to']}') — the first one wins")
+            seen.setdefault(m["from"], m["to"])
+
+    for m1 in pkg:
+        for m2 in pkg:
+            if m1 is not m2 and m2["from"] in m1["to"]:
+                warnings.append(f"package mapping '{m2['from']}' → '{m2['to']}' would have "
+                                f"cascaded onto the output of '{m1['from']}' → '{m1['to']}'; "
+                                f"replacements are applied in a single pass, so it will not")
+
+    var_variations = [(m, set(generate_name_variations(m["from"])),
+                       set(generate_name_variations(m["to"]))) for m in var]
+    for m1, _, to_vars1 in var_variations:
+        for m2, from_vars2, _ in var_variations:
+            if m1 is not m2 and to_vars1 & from_vars2:
+                warnings.append(f"variable mapping '{m2['from']}' → '{m2['to']}' overlaps the "
+                                f"output of '{m1['from']}' → '{m1['to']}' "
+                                f"({', '.join(sorted(to_vars1 & from_vars2))}); "
+                                f"replacements are applied in a single pass, so it will not cascade")
+    return warnings
+
+
 def apply_variable_mappings(source: str, var_mappings: list) -> str:
     """
     Apply variable/class name mappings with word boundary awareness.
     Handles both standalone names and compound names (e.g., IngredientService, INGREDIENT_TYPE).
     Preserves plural/singular forms during mapping.
     """
-    for mapping in var_mappings:
-        from_name = mapping.get("from", "")
-        to_name = mapping.get("to", "")
-        if not from_name or not to_name:
-            continue
-        for pattern, replacement in variable_mapping_patterns(from_name, to_name):
-            source = re.sub(pattern, replacement, source)
-    return source
+    return _cached_renamer(build_variable_rules(var_mappings)).apply(source)
 
 
 # ─────────────────────────────────────────────
@@ -487,41 +636,19 @@ def get_language(mapping_dict: dict, cli_flag: "str | None" = None) -> str:
     return key if key in LANGUAGES else DEFAULT_LANG
 
 
-def apply_mappings(source: str, mappings: list) -> str:
-    """Apply plain string mappings (package names / path segments)"""
-    for m in mappings:
-        frm, to = m.get("from", ""), m.get("to", "")
-        if frm and to:
-            source = source.replace(frm, to)
-    return source
-
-
 def apply_all_mappings(source: str, mapping_dict: dict) -> str:
-    """Apply both package and variable mappings to source code"""
-    # Apply package mappings first
-    pkg_mappings = mapping_dict.get("package", [])
-    source = apply_mappings(source, pkg_mappings)
+    """Apply both package and variable mappings to source code in a single pass."""
+    return _cached_renamer(build_content_rules(mapping_dict)).apply(source)
 
-    # Then apply variable/class mappings
-    var_mappings = mapping_dict.get("variable", [])
-    source = apply_variable_mappings(source, var_mappings)
 
-    return source
+def apply_all_mappings_count(source: str, mapping_dict: dict) -> "tuple[str, int]":
+    """Like apply_all_mappings, but also returns the substitution count (for dry runs)."""
+    return _cached_renamer(build_content_rules(mapping_dict)).apply_count(source)
 
 
 def apply_path_mappings(path_value, mapping_dict: dict, lang: dict) -> Path:
     """Apply package/path and variable mappings to a path string or Path."""
-    path_text = str(path_value)
-
-    for mapping in mapping_dict.get("package", []):
-        frm = mapping.get("from", "")
-        to = mapping.get("to", "")
-        if frm and to:
-            for f_variant, t_variant in lang["pkg_path_variants"](frm, to):
-                path_text = path_text.replace(f_variant, t_variant)
-
-    path_text = apply_variable_mappings(path_text, mapping_dict.get("variable", []))
-    return Path(path_text)
+    return Path(_cached_renamer(build_path_rules(mapping_dict, lang)).apply(str(path_value)))
 
 
 def rename_source_path(file_path: Path, mapping_dict: dict, lang: dict) -> Path:
@@ -534,13 +661,13 @@ def rename_source_path(file_path: Path, mapping_dict: dict, lang: dict) -> Path:
 
 def java_output_rel_path(module_id: str, mapping_dict: dict) -> Path:
     """Output path for a Java class: sanitized FQN → package-directory path."""
-    pkg_mappings = mapping_dict.get("package", [])
+    pkg_rules = []
+    for m in mapping_dict.get("package", []):
+        if m.get("from") and m.get("to"):
+            pkg_rules.extend(package_mapping_patterns(m["from"], m["to"]))
     var_mappings = mapping_dict.get("variable", [])
 
-    sanitized_fqn = module_id
-    for m in pkg_mappings:
-        if m.get("from") and m.get("to"):
-            sanitized_fqn = sanitized_fqn.replace(m["from"], m["to"])
+    sanitized_fqn = _cached_renamer(tuple(pkg_rules)).apply(module_id)
 
     pkg_name, sep, class_name = sanitized_fqn.rpartition(".")
     if sep:

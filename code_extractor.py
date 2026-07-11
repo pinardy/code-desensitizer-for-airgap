@@ -24,6 +24,7 @@ import json
 import shutil
 import hashlib
 import argparse
+import functools
 from datetime import datetime
 from pathlib import Path
 
@@ -361,10 +362,8 @@ def generate_name_variations(base_name: str) -> list:
 
 def variable_mapping_patterns(from_name: str, to_name: str) -> list:
     """
-    Expand one variable mapping into ordered (regex_pattern, replacement) pairs
+    Expand one variable mapping into (regex_pattern, replacement) pairs
     covering all name variations, word boundaries, and compound identifiers.
-    The lookaround syntax is valid in Python re, Perl, and .NET regex alike, so
-    the same pairs drive apply_variable_mappings and the generated shell scripts.
     """
     pairs = []
     for from_var in generate_name_variations(from_name):
@@ -446,13 +445,8 @@ class Renamer:
             parts.append(f"(?P<{group}>{pattern})")
         self._regex = re.compile("|".join(parts)) if parts else None
 
-    def _lookup(self, match) -> str:
-        return self._replacements[match.lastgroup]
-
     def apply(self, text: str) -> str:
-        if self._regex is None:
-            return text
-        return self._regex.sub(self._lookup, text)
+        return self.apply_count(text)[0]
 
     def apply_count(self, text: str) -> tuple[str, int]:
         """Like apply, but also returns the number of substitutions made."""
@@ -468,14 +462,11 @@ class Renamer:
         return self._regex.sub(counting_lookup, text), count
 
 
-_RENAMER_CACHE = {}
+_cached_renamer = functools.lru_cache(maxsize=None)(Renamer)
 
 
-def _cached_renamer(rules: tuple) -> Renamer:
-    renamer = _RENAMER_CACHE.get(rules)
-    if renamer is None:
-        renamer = _RENAMER_CACHE[rules] = Renamer(rules)
-    return renamer
+def _valid_mappings(mappings: list) -> list:
+    return [m for m in mappings if m.get("from") and m.get("to")]
 
 
 def package_mapping_patterns(frm: str, to: str) -> list:
@@ -487,11 +478,17 @@ def package_mapping_patterns(frm: str, to: str) -> list:
     return [(r"(?<![A-Za-z0-9_])" + re.escape(frm) + r"(?![A-Za-z0-9_])", to)]
 
 
+def build_package_rules(pkg_mappings: list) -> tuple:
+    rules = []
+    for m in _valid_mappings(pkg_mappings):
+        rules.extend(package_mapping_patterns(m["from"], m["to"]))
+    return tuple(rules)
+
+
 def build_variable_rules(var_mappings: list) -> tuple:
     rules = []
-    for m in var_mappings:
-        if m.get("from") and m.get("to"):
-            rules.extend(variable_mapping_patterns(m["from"], m["to"]))
+    for m in _valid_mappings(var_mappings):
+        rules.extend(variable_mapping_patterns(m["from"], m["to"]))
     return tuple(rules)
 
 
@@ -501,23 +498,17 @@ def build_content_rules(mapping_dict: dict) -> tuple:
     Names are intentionally replaced inside strings and comments too — a
     sensitive name must not survive anywhere in the sanitized output.
     """
-    rules = []
-    for m in mapping_dict.get("package", []):
-        if m.get("from") and m.get("to"):
-            rules.extend(package_mapping_patterns(m["from"], m["to"]))
-    rules.extend(build_variable_rules(mapping_dict.get("variable", [])))
-    return tuple(rules)
+    return (build_package_rules(mapping_dict.get("package", []))
+            + build_variable_rules(mapping_dict.get("variable", [])))
 
 
 def build_path_rules(mapping_dict: dict, lang: dict) -> tuple:
     """Rules for file paths: language-specific package path variants + variable mappings."""
     rules = []
-    for m in mapping_dict.get("package", []):
-        if m.get("from") and m.get("to"):
-            for f_variant, t_variant in lang["pkg_path_variants"](m["from"], m["to"]):
-                rules.extend(package_mapping_patterns(f_variant, t_variant))
-    rules.extend(build_variable_rules(mapping_dict.get("variable", [])))
-    return tuple(rules)
+    for m in _valid_mappings(mapping_dict.get("package", [])):
+        for f_variant, t_variant in lang["pkg_path_variants"](m["from"], m["to"]):
+            rules.extend(package_mapping_patterns(f_variant, t_variant))
+    return tuple(rules) + build_variable_rules(mapping_dict.get("variable", []))
 
 
 def validate_mappings(mapping_dict: dict) -> list:
@@ -528,8 +519,8 @@ def validate_mappings(mapping_dict: dict) -> list:
     replacements, so such cascades no longer happen — warn instead).
     """
     warnings = []
-    pkg = [m for m in mapping_dict.get("package", []) if m.get("from") and m.get("to")]
-    var = [m for m in mapping_dict.get("variable", []) if m.get("from") and m.get("to")]
+    pkg = _valid_mappings(mapping_dict.get("package", []))
+    var = _valid_mappings(mapping_dict.get("variable", []))
 
     for kind, mappings in (("package", pkg), ("variable", var)):
         seen = {}
@@ -641,8 +632,7 @@ def load_mappings(mapping_file: Path) -> dict:
 
 def save_mappings(mappings: dict, mapping_file: Path):
     """Save mappings in the v2 schema (see load_mappings)."""
-    mappings = {"version": MAPPING_SCHEMA_VERSION, **mappings}
-    mappings["version"] = MAPPING_SCHEMA_VERSION
+    mappings = {**mappings, "version": MAPPING_SCHEMA_VERSION}
     with open(mapping_file, "w", encoding="utf-8") as f:
         json.dump(mappings, f, indent=2)
     print(green(f"  Mappings saved → {mapping_file}"))
@@ -679,13 +669,8 @@ def rename_source_path(file_path: Path, mapping_dict: dict, lang: dict) -> Path:
 
 def java_output_rel_path(module_id: str, mapping_dict: dict) -> Path:
     """Output path for a Java class: sanitized FQN → package-directory path."""
-    pkg_rules = []
-    for m in mapping_dict.get("package", []):
-        if m.get("from") and m.get("to"):
-            pkg_rules.extend(package_mapping_patterns(m["from"], m["to"]))
     var_mappings = mapping_dict.get("variable", [])
-
-    sanitized_fqn = _cached_renamer(tuple(pkg_rules)).apply(module_id)
+    sanitized_fqn = _cached_renamer(build_package_rules(mapping_dict.get("package", []))).apply(module_id)
 
     pkg_name, sep, class_name = sanitized_fqn.rpartition(".")
     if sep:
@@ -731,7 +716,7 @@ class StringMaskRegistry:
         self._by_literal = {v: k for k, v in self._by_token.items()}
         self._next = 0
         for token in self._by_token:
-            m = re.fullmatch(r"STR_(\d+)", token)
+            m = re.fullmatch(MASK_PREFIX + r"_(\d+)", token)
             if m:
                 self._next = max(self._next, int(m.group(1)) + 1)
 
@@ -739,7 +724,7 @@ class StringMaskRegistry:
         """Register a literal (quotes included) and return its bare token, e.g. 'STR_7'."""
         token = self._by_literal.get(literal)
         if token is None:
-            token = f"STR_{self._next}"
+            token = f"{MASK_PREFIX}_{self._next}"
             self._next += 1
             self._by_token[token] = literal
             self._by_literal[literal] = token
@@ -754,8 +739,10 @@ class StringMaskRegistry:
 # blocks (\"\"\") and char literals are not masked.
 JAVA_STRING_RE = re.compile(r'"[^"\\\n]*(?:\\.[^"\\\n]*)*"')
 
-MASK_TOKEN_RE = re.compile(r"([\"'`])STR_(\d+)\1")
-BARE_MASK_TOKEN_RE = re.compile(r"\bSTR_\d+\b")
+# Mask-token shape is owned here; everything else derives from MASK_PREFIX.
+MASK_PREFIX = "STR"
+MASK_TOKEN_RE = re.compile(r"([\"'`])" + MASK_PREFIX + r"_(\d+)\1")
+BARE_MASK_TOKEN_RE = re.compile(r"\b" + MASK_PREFIX + r"_\d+\b")
 
 
 def mask_strings_java(source: str, registry: StringMaskRegistry) -> str:
@@ -776,7 +763,7 @@ def unmask_strings(text: str, strings: dict) -> tuple[str, int]:
 
     def replacer(m):
         nonlocal count
-        original = strings.get(f"STR_{m.group(2)}")
+        original = strings.get(f"{MASK_PREFIX}_{m.group(2)}")
         if original is None:
             return m.group(0)  # unknown token — leave untouched
         count += 1
@@ -935,10 +922,13 @@ def sanitize(source: str, mapping_dict: dict, options: dict, lang: dict,
              registry: StringMaskRegistry | None = None) -> str:
     # Masking runs after renaming, so recorded literals contain sanitized names.
     # Reversal unmasks first, then un-renames — restoring the originals exactly.
+    if options.get("mask_strings") and registry is None:
+        raise ValueError("mask_strings requires a StringMaskRegistry — "
+                         "masking without recording the originals is irreversible")
     source = apply_all_mappings(source, mapping_dict)
     if options.get("strip_comments"):   source = lang["strip_comments"](source)
     if options.get("strip_javadoc"):    source = lang["strip_doc_tags"](source)
-    if options.get("mask_strings"):     source = lang["mask_strings"](source, registry if registry is not None else StringMaskRegistry())
+    if options.get("mask_strings"):     source = lang["mask_strings"](source, registry)
     if options.get("strip_loggers"):    source = lang["strip_loggers"](source)
     return source.strip()
 
@@ -991,7 +981,8 @@ def apply_reversal(target_dir: Path, mapping_dict: dict, lang: dict,
     rename file paths. Refuses to run twice on the same directory with the
     same mapping (marker file) unless force=True.
     """
-    result = {"renamed": [], "changed": [], "warnings": [], "strings_restored": 0}
+    result = {"renamed": [], "changed": [], "warnings": [], "strings_restored": 0,
+              "refused": False}
     reversed_maps = reverse_mappings(mapping_dict)
     strings = mapping_dict.get("strings", {})
     fingerprint = _mapping_fingerprint(mapping_dict)
@@ -1006,20 +997,13 @@ def apply_reversal(target_dir: Path, mapping_dict: dict, lang: dict,
             print(red(f"  This directory was already reversed with this mapping on "
                       f"{marker.get('timestamp', 'an earlier run')}."))
             print(red("  Re-running could corrupt names. Use --force to override."))
-            result["warnings"].append("already reversed — refused (use --force)")
+            result["refused"] = True
             return result
 
     source_files = _glob_sources(target_dir, lang)
     if not source_files:
         print(yellow("  No matching source files found in target directory."))
         return result
-
-    if not strings:
-        for sf in source_files:
-            if BARE_MASK_TOKEN_RE.search(read_source(sf)):
-                result["warnings"].append(f"{sf}: contains STR_n placeholders but the mapping has "
-                                          f"no 'strings' section (predates string masking support?) "
-                                          f"— placeholders will be left as-is")
 
     if backup and not dry_run:
         backup_dir = target_dir.with_name(
@@ -1033,9 +1017,11 @@ def apply_reversal(target_dir: Path, mapping_dict: dict, lang: dict,
         unmasked, restored = unmask_strings(original, strings)
         updated, substitutions = apply_all_mappings_count(unmasked, reversed_maps)
         leftover = sorted(set(BARE_MASK_TOKEN_RE.findall(updated)))
-        if leftover and strings:
-            result["warnings"].append(f"{sf}: unrestorable placeholder(s) left in place: "
-                                      f"{', '.join(leftover)}")
+        if leftover:
+            reason = ("unrestorable placeholder(s) left in place" if strings else
+                      "placeholder(s) found but the mapping has no 'strings' section "
+                      "(predates string masking support?) — left as-is")
+            result["warnings"].append(f"{sf}: {reason}: {', '.join(leftover)}")
         if updated != original:
             result["changed"].append(sf)
             result["strings_restored"] += restored
@@ -1045,8 +1031,7 @@ def apply_reversal(target_dir: Path, mapping_dict: dict, lang: dict,
             else:
                 sf.write_text(updated, encoding="utf-8")
 
-    renamed_count = 0
-    for sf in _glob_sources(target_dir, lang):
+    for sf in source_files:
         renamed_path = rename_source_path(sf, reversed_maps, lang)
         if renamed_path != sf:
             if renamed_path.exists():
@@ -1059,7 +1044,6 @@ def apply_reversal(target_dir: Path, mapping_dict: dict, lang: dict,
             else:
                 renamed_path.parent.mkdir(parents=True, exist_ok=True)
                 sf.rename(renamed_path)
-                renamed_count += 1
 
     for w in result["warnings"]:
         print(yellow(f"  [!] {w}"))
@@ -1071,10 +1055,10 @@ def apply_reversal(target_dir: Path, mapping_dict: dict, lang: dict,
         marker_file.write_text(json.dumps({
             "mapping_sha256": fingerprint,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "renamed": renamed_count,
+            "renamed": len(result["renamed"]),
             "changed": len(result["changed"]),
         }, indent=2), encoding="utf-8")
-        print(green(f"  Reversal complete — {renamed_count} file(s) renamed, "
+        print(green(f"  Reversal complete — {len(result['renamed'])} file(s) renamed, "
                     f"{len(result['changed'])}/{len(source_files)} files updated."))
     return result
 
@@ -1201,7 +1185,6 @@ LANGUAGES = {
         "mask_strings":      mask_strings_java,
         "strip_loggers":     strip_loggers_java,
         "pkg_path_variants": _java_pkg_path_variants,
-        "pkg_to_posix":      lambda s: s.replace(".", "/"),
         "prompt_template":   java_prompt_template,
     },
     "react": {
@@ -1227,7 +1210,6 @@ LANGUAGES = {
         "mask_strings":      mask_strings_react,
         "strip_loggers":     strip_loggers_react,
         "pkg_path_variants": _react_pkg_path_variants,
-        "pkg_to_posix":      lambda s: s,
         "prompt_template":   react_prompt_template,
     },
 }
@@ -1322,6 +1304,40 @@ Keep it inside the airgap — never share it alongside the sanitized files.
     instructions_file = out_dir / "REVERSE_INSTRUCTIONS.txt"
     instructions_file.write_text(instructions, encoding="utf-8")
     print(green(f"  Reversal instructions → {instructions_file}"))
+
+
+def run_extraction(deps: dict, mapping_dict: dict, options: dict, out_dir: Path,
+                   lang: dict, lang_key: str, test_framework: str = None,
+                   dry_run: bool = False):
+    """Extraction pipeline shared by the CLI and interactive frontends."""
+    if dry_run:
+        print()
+        print(bold("Dry run — planned output:"))
+        for module_id, info in deps.items():
+            if info["path"] is None:
+                print(yellow(f"  Would skip:  {module_id} — source not found"))
+                continue
+            rel_path = lang["output_rel_path"](module_id, mapping_dict)
+            _, count = apply_all_mappings_count(info["source"], mapping_dict)
+            print(f"  Would write: {out_dir / rel_path}  ({count} substitution(s))")
+        for artifact in ("mapping.json", "CLAUDE_PROMPT.txt", "REVERSE_INSTRUCTIONS.txt"):
+            print(f"  Would write: {out_dir / artifact}")
+        print(bold("  No files written (--dry-run)."))
+        return
+
+    print()
+    print(bold("Writing sanitized files..."))
+    registry = StringMaskRegistry(mapping_dict.get("strings"))
+    write_extracted(deps, mapping_dict, options, out_dir, lang, registry)
+    write_claude_prompt(deps, out_dir, lang, mapping_dict, test_framework)
+
+    # Save mappings for reversal: 'language' lets `reverse` auto-detect the
+    # project type; 'strings' is what makes --mask-strings reversible.
+    mapping_dict["language"] = lang_key
+    mapping_dict["strings"] = registry.to_dict()
+    save_mappings(mapping_dict, out_dir / "mapping.json")
+    write_reverse_instructions(out_dir)
+
 
 # ─────────────────────────────────────────────
 #  Interactive menu
@@ -1470,23 +1486,12 @@ def interactive_trace():
         print(yellow("  Aborted — no files written."))
         return
 
-    print()
-    print(bold("Writing sanitized files..."))
-    registry = StringMaskRegistry(mapping_dict.get("strings"))
-    write_extracted(deps, mapping_dict, options, out_dir, lang, registry)
-    write_claude_prompt(deps, out_dir, lang, mapping_dict, test_framework)
-
-    # Save mappings for reversal (language recorded so `reverse` auto-detects it)
-    mapping_dict["language"] = lang_key
-    mapping_dict["strings"] = registry.to_dict()
-    final_map = out_dir / "mapping.json"
-    save_mappings(mapping_dict, final_map)
-    write_reverse_instructions(out_dir)
+    run_extraction(deps, mapping_dict, options, out_dir, lang, lang_key, test_framework)
 
     print()
     print(bold("═══ Done ═══"))
     print(f"  Extracted files : {out_dir}")
-    print(f"  Mapping file    : {final_map}")
+    print(f"  Mapping file    : {out_dir / 'mapping.json'}")
     print(f"  Claude prompt   : {out_dir / 'CLAUDE_PROMPT.txt'}")
     print()
     print(dim("  Next steps:"))
@@ -1604,33 +1609,8 @@ def cmd_trace(args):
 
     print_checklist(deps, lang)
 
-    if args.dry_run:
-        print()
-        print(bold("Dry run — planned output:"))
-        for module_id, info in deps.items():
-            if info["path"] is None:
-                print(yellow(f"  Would skip:  {module_id} — source not found"))
-                continue
-            rel_path = lang["output_rel_path"](module_id, mapping_dict)
-            _, count = apply_all_mappings_count(info["source"], mapping_dict)
-            print(f"  Would write: {out_dir / rel_path}  ({count} substitution(s))")
-        print(f"  Would write: {out_dir / 'mapping.json'}")
-        print(f"  Would write: {out_dir / 'CLAUDE_PROMPT.txt'}")
-        print(f"  Would write: {out_dir / 'REVERSE_INSTRUCTIONS.txt'}")
-        print(bold("  No files written (--dry-run)."))
-        return
-
-    print()
-    print(bold("Writing sanitized files..."))
-    registry = StringMaskRegistry(mapping_dict.get("strings"))
-    write_extracted(deps, mapping_dict, options, out_dir, lang, registry)
-    write_claude_prompt(deps, out_dir, lang, mapping_dict, args.test_framework)
-
-    mapping_dict["language"] = lang_key
-    mapping_dict["strings"] = registry.to_dict()
-    final_map = out_dir / "mapping.json"
-    save_mappings(mapping_dict, final_map)
-    write_reverse_instructions(out_dir)
+    run_extraction(deps, mapping_dict, options, out_dir, lang, lang_key,
+                   args.test_framework, dry_run=args.dry_run)
 
 
 def cmd_reverse(args):
@@ -1654,7 +1634,7 @@ def cmd_reverse(args):
     print(green(f"Language: {lang['label']}"))
     result = apply_reversal(target_dir, mapping_dict, lang,
                             dry_run=args.dry_run, backup=not args.no_backup, force=args.force)
-    if any("already reversed" in w for w in result["warnings"]):
+    if result["refused"]:
         sys.exit(1)
 
 

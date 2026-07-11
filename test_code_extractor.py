@@ -31,6 +31,7 @@ from code_extractor import (
     mask_strings_java,
     mask_strings_react,
     unmask_strings,
+    sanitize,
     load_mappings,
     save_mappings,
     trace,
@@ -363,6 +364,13 @@ def test_registry_seeding_continues_numbering():
     assert registry.add('"a"') == "STR_0"
 
 
+def test_sanitize_masking_requires_registry():
+    # Masking without recording the originals would be irreversible
+    with pytest.raises(ValueError):
+        sanitize('x = "a";', ORDER_MAPPING, dict(NO_STRIP, mask_strings=True),
+                 LANGUAGES["spring"], registry=None)
+
+
 # ─────────────────────────────────────────────
 #  mapping.json schema
 # ─────────────────────────────────────────────
@@ -522,6 +530,7 @@ REACT_MAPPING = {
 
 NO_STRIP = {"strip_comments": False, "strip_javadoc": False,
             "mask_strings": False, "strip_loggers": False}
+ALL_STRIP = {k: True for k in NO_STRIP}
 
 
 def make_spring_project(tmp_path: Path) -> Path:
@@ -542,6 +551,14 @@ def make_react_project(tmp_path: Path) -> Path:
     return src_root
 
 
+def make_generated_dir(tmp_path: Path) -> tuple:
+    """A minimal 'AI-generated tests' directory plus the mapping to reverse it."""
+    generated = tmp_path / "generated-tests"
+    generated.mkdir()
+    (generated / "RecordTest.java").write_text("class RecordTest { Record r; }", encoding="utf-8")
+    return generated, dict(SPRING_MAPPING, language="spring")
+
+
 def tree_snapshot(root: Path) -> dict:
     return {p.relative_to(root).as_posix(): p.read_bytes()
             for p in sorted(root.rglob("*")) if p.is_file()}
@@ -557,9 +574,8 @@ def assert_fully_sanitized(out_dir: Path, mapping: dict, lang: dict):
         if not p.is_file():
             continue
         rel = p.relative_to(out_dir).as_posix()
-        assert str(apply_path_mappings(rel, mapping, lang)) == rel.replace("/", os.sep) \
-            or str(apply_path_mappings(rel, mapping, lang)) == rel, \
-            f"path not fully sanitized: {rel}"
+        mapped = str(apply_path_mappings(rel, mapping, lang))
+        assert mapped in (rel, rel.replace("/", os.sep)), f"path not fully sanitized: {rel}"
         if p.suffix in (".java", ".ts", ".tsx", ".js", ".jsx"):
             content = p.read_text(encoding="utf-8")
             assert apply_all_mappings(content, mapping) == content, \
@@ -582,9 +598,7 @@ def test_spring_trace_and_sanitize(tmp_path, capsys):
 
     out_dir = tmp_path / "extracted"
     registry = StringMaskRegistry()
-    options = {"strip_comments": True, "strip_javadoc": True,
-               "mask_strings": True, "strip_loggers": True}
-    write_extracted(deps, SPRING_MAPPING, options, out_dir, LANGUAGES["spring"], registry)
+    write_extracted(deps, SPRING_MAPPING, ALL_STRIP, out_dir, LANGUAGES["spring"], registry)
 
     assert_fully_sanitized(out_dir, SPRING_MAPPING, LANGUAGES["spring"])
     assert (out_dir / "com/example/service/RecordService.java").exists()
@@ -606,9 +620,7 @@ def test_react_trace_and_sanitize(tmp_path):
 
     out_dir = tmp_path / "extracted"
     registry = StringMaskRegistry()
-    options = {"strip_comments": True, "strip_javadoc": True,
-               "mask_strings": True, "strip_loggers": True}
-    write_extracted(deps, REACT_MAPPING, options, out_dir, LANGUAGES["react"], registry)
+    write_extracted(deps, REACT_MAPPING, ALL_STRIP, out_dir, LANGUAGES["react"], registry)
 
     assert_fully_sanitized(out_dir, REACT_MAPPING, LANGUAGES["react"])
     assert (out_dir / "features/feature1/WidgetList.tsx").exists()
@@ -684,17 +696,14 @@ def test_reversal_of_ai_generated_test_file(tmp_path):
 
 
 def test_reverse_twice_refused_and_force_is_noop(tmp_path):
-    generated = tmp_path / "generated-tests"
-    generated.mkdir()
-    (generated / "RecordTest.java").write_text("class RecordTest { Record r; }", encoding="utf-8")
-    mapping = dict(SPRING_MAPPING, language="spring")
+    generated, mapping = make_generated_dir(tmp_path)
 
     first = apply_reversal(generated, mapping, LANGUAGES["spring"], backup=False)
-    assert first["changed"]
+    assert first["changed"] and not first["refused"]
     snapshot = tree_snapshot(generated)
 
     second = apply_reversal(generated, mapping, LANGUAGES["spring"], backup=False)
-    assert any("already reversed" in w for w in second["warnings"])
+    assert second["refused"]
     assert tree_snapshot(generated) == snapshot
 
     forced = apply_reversal(generated, mapping, LANGUAGES["spring"], backup=False, force=True)
@@ -704,10 +713,7 @@ def test_reverse_twice_refused_and_force_is_noop(tmp_path):
 
 
 def test_reverse_dry_run_writes_nothing(tmp_path):
-    generated = tmp_path / "generated-tests"
-    generated.mkdir()
-    (generated / "RecordTest.java").write_text("class RecordTest { Record r; }", encoding="utf-8")
-    mapping = dict(SPRING_MAPPING, language="spring")
+    generated, mapping = make_generated_dir(tmp_path)
 
     before = tree_snapshot(generated)
     result = apply_reversal(generated, mapping, LANGUAGES["spring"], dry_run=True)
@@ -718,12 +724,10 @@ def test_reverse_dry_run_writes_nothing(tmp_path):
 
 
 def test_reverse_creates_backup(tmp_path):
-    generated = tmp_path / "generated-tests"
-    generated.mkdir()
-    (generated / "RecordTest.java").write_text("class RecordTest { Record r; }", encoding="utf-8")
+    generated, mapping = make_generated_dir(tmp_path)
     before = tree_snapshot(generated)
 
-    apply_reversal(generated, dict(SPRING_MAPPING, language="spring"), LANGUAGES["spring"])
+    apply_reversal(generated, mapping, LANGUAGES["spring"])
     backups = list(tmp_path.glob("generated-tests.backup-*"))
     assert len(backups) == 1
     assert tree_snapshot(backups[0]) == before

@@ -19,7 +19,10 @@ import os
 import re
 import sys
 import json
+import shutil
+import hashlib
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 
@@ -580,7 +583,7 @@ def trace(entry_path: Path, scope: str, src_root: Path, lang: dict) -> dict:
     while queue:
         current = queue.pop(0)
         try:
-            source = current.read_text(encoding="utf-8", errors="replace")
+            source = read_source(current)
         except Exception as e:
             print(red(f"  [!] Cannot read {current}: {e}"))
             continue
@@ -959,34 +962,119 @@ def _glob_sources(target_dir: Path, lang: dict) -> list:
     return sorted(files, key=lambda path: len(path.parts), reverse=True)
 
 
-def apply_reversal(target_dir: Path, mapping_dict: dict, lang: dict):
-    """Apply reversed mappings to all source files in target directory."""
+REVERSAL_MARKER = ".code_extractor_reversed.json"
+
+
+def read_source(path: Path) -> str:
+    """Read a source file as strict UTF-8; fall back with a loud warning instead of silent corruption."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        print(yellow(f"  [!] {path}: not valid UTF-8 — {text.count(chr(0xFFFD))} character(s) replaced. "
+                     f"Reversal may not restore this file exactly."))
+        return text
+
+
+def _mapping_fingerprint(mapping_dict: dict) -> str:
+    canonical = json.dumps(mapping_dict, sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def apply_reversal(target_dir: Path, mapping_dict: dict, lang: dict,
+                   dry_run: bool = False, backup: bool = True, force: bool = False) -> dict:
+    """
+    Restore original names in all source files under target_dir:
+    unmask string literals first, then un-rename identifiers/packages, then
+    rename file paths. Refuses to run twice on the same directory with the
+    same mapping (marker file) unless force=True.
+    """
+    result = {"renamed": [], "changed": [], "warnings": [], "strings_restored": 0}
     reversed_maps = reverse_mappings(mapping_dict)
+    strings = mapping_dict.get("strings", {})
+    fingerprint = _mapping_fingerprint(mapping_dict)
+
+    marker_file = target_dir / REVERSAL_MARKER
+    if marker_file.exists() and not force and not dry_run:
+        try:
+            marker = json.loads(marker_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            marker = {}
+        if marker.get("mapping_sha256") == fingerprint:
+            print(red(f"  This directory was already reversed with this mapping on "
+                      f"{marker.get('timestamp', 'an earlier run')}."))
+            print(red("  Re-running could corrupt names. Use --force to override."))
+            result["warnings"].append("already reversed — refused (use --force)")
+            return result
+
     source_files = _glob_sources(target_dir, lang)
     if not source_files:
         print(yellow("  No matching source files found in target directory."))
-        return
+        return result
 
-    renamed = 0
+    if not strings:
+        for sf in source_files:
+            if BARE_MASK_TOKEN_RE.search(read_source(sf)):
+                result["warnings"].append(f"{sf}: contains STR_n placeholders but the mapping has "
+                                          f"no 'strings' section (predates string masking support?) "
+                                          f"— placeholders will be left as-is")
+
+    if backup and not dry_run:
+        backup_dir = target_dir.with_name(
+            target_dir.name + ".backup-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+        shutil.copytree(target_dir, backup_dir)
+        print(green(f"  Backup → {backup_dir}"))
+
+    # Content first (on stable paths), then file renames.
     for sf in source_files:
+        original = read_source(sf)
+        unmasked, restored = unmask_strings(original, strings)
+        updated, substitutions = apply_all_mappings_count(unmasked, reversed_maps)
+        leftover = sorted(set(BARE_MASK_TOKEN_RE.findall(updated)))
+        if leftover and strings:
+            result["warnings"].append(f"{sf}: unrestorable placeholder(s) left in place: "
+                                      f"{', '.join(leftover)}")
+        if updated != original:
+            result["changed"].append(sf)
+            result["strings_restored"] += restored
+            if dry_run:
+                print(f"  Would update: {sf}  "
+                      f"({substitutions} substitution(s), {restored} string(s) restored)")
+            else:
+                sf.write_text(updated, encoding="utf-8")
+
+    renamed_count = 0
+    for sf in _glob_sources(target_dir, lang):
         renamed_path = rename_source_path(sf, reversed_maps, lang)
         if renamed_path != sf:
             if renamed_path.exists():
                 print(yellow(f"  [skip] file rename collision: {sf.name} -> {renamed_path.name}"))
+                result["warnings"].append(f"rename collision: {sf} -> {renamed_path}")
                 continue
-            renamed_path.parent.mkdir(parents=True, exist_ok=True)
-            sf.rename(renamed_path)
-            renamed += 1
+            result["renamed"].append((sf, renamed_path))
+            if dry_run:
+                print(f"  Would rename: {sf} -> {renamed_path}")
+            else:
+                renamed_path.parent.mkdir(parents=True, exist_ok=True)
+                sf.rename(renamed_path)
+                renamed_count += 1
 
-    changed = 0
-    source_files = _glob_sources(target_dir, lang)
-    for sf in source_files:
-        original = sf.read_text(encoding="utf-8", errors="replace")
-        result   = apply_all_mappings(original, reversed_maps)
-        if result != original:
-            sf.write_text(result, encoding="utf-8")
-            changed += 1
-    print(green(f"  Reversal complete — {renamed} file(s) renamed, {changed}/{len(source_files)} files updated."))
+    for w in result["warnings"]:
+        print(yellow(f"  [!] {w}"))
+
+    if dry_run:
+        print(bold(f"  {len(result['renamed'])} file(s) to rename, "
+                   f"{len(result['changed'])} file(s) to update. No changes written (--dry-run)."))
+    else:
+        marker_file.write_text(json.dumps({
+            "mapping_sha256": fingerprint,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "renamed": renamed_count,
+            "changed": len(result["changed"]),
+        }, indent=2), encoding="utf-8")
+        print(green(f"  Reversal complete — {renamed_count} file(s) renamed, "
+                    f"{len(result['changed'])}/{len(source_files)} files updated."))
+    return result
 
 
 # ─────────────────────────────────────────────

@@ -613,18 +613,31 @@ def trace(entry_path: Path, scope: str, src_root: Path, lang: dict) -> dict:
 #  Sanitization
 # ─────────────────────────────────────────────
 
+MAPPING_SCHEMA_VERSION = 2
+
+
 def load_mappings(mapping_file: Path) -> dict:
-    """Load mappings from file. Returns {'package': [...], 'variable': [...], 'language': ...?}"""
+    """
+    Load mappings and normalize to the v2 schema:
+      {"version": 2, "language": ..., "package": [...], "variable": [...], "strings": {...}}
+    Accepts the legacy bare-list format (package mappings only) and v1 dicts
+    (no 'version'/'strings' keys).
+    """
     with open(mapping_file, encoding="utf-8") as f:
         data = json.load(f)
-    # Support both old format (list) and new format (dict with 'package' and 'variable')
     if isinstance(data, list):
-        return {"package": data, "variable": []}
+        data = {"package": data}
+    data.setdefault("package", [])
+    data.setdefault("variable", [])
+    data.setdefault("strings", {})
+    data["version"] = MAPPING_SCHEMA_VERSION
     return data
 
 
 def save_mappings(mappings: dict, mapping_file: Path):
-    """Save mappings to file: {'language': ..., 'package': [...], 'variable': [...]}"""
+    """Save mappings in the v2 schema (see load_mappings)."""
+    mappings = {"version": MAPPING_SCHEMA_VERSION, **mappings}
+    mappings["version"] = MAPPING_SCHEMA_VERSION
     with open(mapping_file, "w", encoding="utf-8") as f:
         json.dump(mappings, f, indent=2)
     print(green(f"  Mappings saved → {mapping_file}"))
@@ -698,13 +711,73 @@ def strip_javadoc_tags(source: str) -> str:
     return re.sub(r"@(author|since|version|see)\b[^\n]*", "", source, flags=re.IGNORECASE)
 
 
-def mask_strings_java(source: str) -> str:
-    counter = [0]
+class StringMaskRegistry:
+    """
+    Run-wide registry of masked string literals, so STR_n tokens are unique
+    across all files of a run and can be restored on reversal.
+
+    Stores the FULL original literal including its quote characters; identical
+    literals share one token. Seed with a previously saved mapping's 'strings'
+    section so re-runs never reuse an existing index for a different literal.
+    """
+
+    def __init__(self, existing: "dict | None" = None):
+        self._by_token = dict(existing or {})     # "STR_0" -> '"literal"'
+        self._by_literal = {v: k for k, v in self._by_token.items()}
+        self._next = 0
+        for token in self._by_token:
+            m = re.fullmatch(r"STR_(\d+)", token)
+            if m:
+                self._next = max(self._next, int(m.group(1)) + 1)
+
+    def add(self, literal: str) -> str:
+        """Register a literal (quotes included) and return its bare token, e.g. 'STR_7'."""
+        token = self._by_literal.get(literal)
+        if token is None:
+            token = f"STR_{self._next}"
+            self._next += 1
+            self._by_token[token] = literal
+            self._by_literal[literal] = token
+        return token
+
+    def to_dict(self) -> dict:
+        return dict(self._by_token)
+
+
+# Linear-time string-literal regex (unrolled loop — no nested quantifiers, so no
+# catastrophic backtracking on pathological input). Known limits: Java text
+# blocks (\"\"\") and char literals are not masked.
+JAVA_STRING_RE = re.compile(r'"[^"\\\n]*(?:\\.[^"\\\n]*)*"')
+
+MASK_TOKEN_RE = re.compile(r"([\"'`])STR_(\d+)\1")
+BARE_MASK_TOKEN_RE = re.compile(r"\bSTR_\d+\b")
+
+
+def mask_strings_java(source: str, registry: StringMaskRegistry) -> str:
     def replacer(m):
-        idx = counter[0]
-        counter[0] += 1
-        return f'"STR_{idx}"'
-    return re.sub(r'"([^"\\]|\\.)*"', replacer, source)
+        return f'"{registry.add(m.group(0))}"'
+    return JAVA_STRING_RE.sub(replacer, source)
+
+
+def unmask_strings(text: str, strings: dict) -> "tuple[str, int]":
+    """
+    Restore masked literals: any quoted STR_n token ("STR_1", 'STR_1' or `STR_1`,
+    regardless of which quote style the original had) becomes the recorded
+    original literal, verbatim. Returns (text, restored_count).
+    """
+    if not strings:
+        return text, 0
+    count = 0
+
+    def replacer(m):
+        nonlocal count
+        original = strings.get(f"STR_{m.group(2)}")
+        if original is None:
+            return m.group(0)  # unknown token — leave untouched
+        count += 1
+        return original
+
+    return MASK_TOKEN_RE.sub(replacer, text), count
 
 
 def strip_loggers_java(source: str) -> str:
@@ -812,12 +885,11 @@ def strip_comments_react(source: str) -> str:
     return result
 
 
-def mask_strings_react(source: str) -> str:
+def mask_strings_react(source: str, registry: StringMaskRegistry) -> str:
     """
     Mask string literals — but never import/export/require specifiers,
     and never template literals containing ${...} interpolation.
     """
-    counter = [0]
     out = []
     line_tail = [""]  # text emitted since the last newline
 
@@ -841,11 +913,9 @@ def mask_strings_react(source: str) -> str:
                 emit(text)
             else:
                 q = text[0]
-                emit(f"{q}STR_{counter[0]}{q}")
-                counter[0] += 1
+                emit(f"{q}{registry.add(text)}{q}")
         elif kind == "template" and "${" not in text:
-            emit(f"`STR_{counter[0]}`")
-            counter[0] += 1
+            emit(f"`{registry.add(text)}`")
         else:
             emit(text)
 
@@ -856,11 +926,14 @@ def strip_loggers_react(source: str) -> str:
     return re.sub(r"[ \t]*console\.(log|info|warn|error|debug|trace)\([^;\n]*\);?\n?", "\n", source)
 
 
-def sanitize(source: str, mapping_dict: dict, options: dict, lang: dict) -> str:
+def sanitize(source: str, mapping_dict: dict, options: dict, lang: dict,
+             registry: "StringMaskRegistry | None" = None) -> str:
+    # Masking runs after renaming, so recorded literals contain sanitized names.
+    # Reversal unmasks first, then un-renames — restoring the originals exactly.
     source = apply_all_mappings(source, mapping_dict)
     if options.get("strip_comments"):   source = lang["strip_comments"](source)
     if options.get("strip_javadoc"):    source = lang["strip_doc_tags"](source)
-    if options.get("mask_strings"):     source = lang["mask_strings"](source)
+    if options.get("mask_strings"):     source = lang["mask_strings"](source, registry if registry is not None else StringMaskRegistry())
     if options.get("strip_loggers"):    source = lang["strip_loggers"](source)
     return source.strip()
 
@@ -1108,7 +1181,8 @@ def print_checklist(deps: dict, lang: dict):
         print(yellow("  Locate them manually or adjust --src."))
 
 
-def write_extracted(deps: dict, mapping_dict: dict, options: dict, out_dir: Path, lang: dict):
+def write_extracted(deps: dict, mapping_dict: dict, options: dict, out_dir: Path, lang: dict,
+                    registry: "StringMaskRegistry | None" = None):
     out_dir.mkdir(parents=True, exist_ok=True)
     written = 0
     for module_id, info in deps.items():
@@ -1116,7 +1190,7 @@ def write_extracted(deps: dict, mapping_dict: dict, options: dict, out_dir: Path
             print(yellow(f"  [skip] {module_id} — source not found"))
             continue
 
-        sanitized = sanitize(info["source"], mapping_dict, options, lang)
+        sanitized = sanitize(info["source"], mapping_dict, options, lang, registry)
         rel_path  = lang["output_rel_path"](module_id, mapping_dict)
         dest      = out_dir / rel_path
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1407,11 +1481,13 @@ def interactive_trace():
 
     print()
     print(bold("Writing sanitized files..."))
-    write_extracted(deps, mapping_dict, options, out_dir, lang)
+    registry = StringMaskRegistry(mapping_dict.get("strings"))
+    write_extracted(deps, mapping_dict, options, out_dir, lang, registry)
     write_claude_prompt(deps, out_dir, lang, mapping_dict, test_framework)
 
     # Save mappings for reversal (language recorded so `reverse` auto-detects it)
     mapping_dict["language"] = lang_key
+    mapping_dict["strings"] = registry.to_dict()
     final_map = out_dir / "mapping.json"
     save_mappings(mapping_dict, final_map)
     write_reversal_script(mapping_dict, out_dir, lang)
@@ -1516,10 +1592,12 @@ def cmd_trace(args):
 
     print()
     print(bold("Writing sanitized files..."))
-    write_extracted(deps, mapping_dict, options, out_dir, lang)
+    registry = StringMaskRegistry(mapping_dict.get("strings"))
+    write_extracted(deps, mapping_dict, options, out_dir, lang, registry)
     write_claude_prompt(deps, out_dir, lang, mapping_dict, args.test_framework)
 
     mapping_dict["language"] = lang_key
+    mapping_dict["strings"] = registry.to_dict()
     final_map = out_dir / "mapping.json"
     save_mappings(mapping_dict, final_map)
     write_reversal_script(mapping_dict, out_dir, lang)

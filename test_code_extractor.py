@@ -22,6 +22,12 @@ from code_extractor import (
     apply_all_mappings,
     apply_variable_mappings,
     LANGUAGES,
+    StringMaskRegistry,
+    mask_strings_java,
+    mask_strings_react,
+    unmask_strings,
+    load_mappings,
+    save_mappings,
 )
 
 
@@ -274,3 +280,108 @@ def test_validate_mappings_warnings():
 
 def test_validate_mappings_clean():
     assert validate_mappings(ORDER_MAPPING) == []
+
+
+# ─────────────────────────────────────────────
+#  String masking / unmasking
+# ─────────────────────────────────────────────
+
+def test_mask_unmask_java_round_trip():
+    src = ('String url = "jdbc:oracle:thin:@prod-db:1521";\n'
+           'String quoted = "he said \\"hi\\"\\n";\n'
+           'String tricky = "contains STR_1 inside";\n')
+    registry = StringMaskRegistry()
+    masked = mask_strings_java(src, registry)
+    assert "jdbc:oracle" not in masked
+    assert 'STR_0' in masked
+    restored, count = unmask_strings(masked, registry.to_dict())
+    assert restored == src
+    assert count == 3
+
+
+def test_mask_java_global_uniqueness_and_dedupe():
+    registry = StringMaskRegistry()
+    m1 = mask_strings_java('String a = "one";', registry)
+    m2 = mask_strings_java('String b = "two"; String c = "one";', registry)
+    assert '"STR_0"' in m1
+    assert '"STR_1"' in m2          # counter continues across files
+    assert '"STR_0"' in m2          # identical literal reuses its token
+    assert registry.to_dict() == {"STR_0": '"one"', "STR_1": '"two"'}
+
+
+def test_mask_java_no_catastrophic_backtracking():
+    import time
+    # A long line with an unterminated quote used to hang the old regex
+    src = '"' + "a" * 50000
+    start = time.monotonic()
+    mask_strings_java(src, StringMaskRegistry())
+    assert time.monotonic() - start < 2.0
+
+
+def test_mask_unmask_react_round_trip():
+    src = ("import { api } from '@/features/payroll/api';\n"
+           "const label = 'Payroll run';\n"
+           "const tpl = `static template`;\n"
+           "const dynamic = `run ${id} done`;\n")
+    registry = StringMaskRegistry()
+    masked = mask_strings_react(src, registry)
+    assert "'@/features/payroll/api'" in masked   # import specifier untouched
+    assert "Payroll run" not in masked
+    assert "static template" not in masked
+    assert "${id}" in masked                       # interpolated template untouched
+    restored, _ = unmask_strings(masked, registry.to_dict())
+    assert restored == src
+
+
+def test_unmask_any_quote_style():
+    # AI-generated tests may restyle quotes around the token
+    strings = {"STR_0": '"original"'}
+    restored, count = unmask_strings("a('STR_0') b(\"STR_0\") c(`STR_0`)", strings)
+    assert restored == 'a("original") b("original") c("original")'
+    assert count == 3
+
+
+def test_unmask_unknown_token_left_alone():
+    restored, count = unmask_strings('x = "STR_99";', {"STR_0": '"a"'})
+    assert restored == 'x = "STR_99";'
+    assert count == 0
+
+
+def test_registry_seeding_continues_numbering():
+    registry = StringMaskRegistry({"STR_0": '"a"', "STR_7": '"b"'})
+    assert registry.add('"new"') == "STR_8"
+    assert registry.add('"a"') == "STR_0"
+
+
+# ─────────────────────────────────────────────
+#  mapping.json schema
+# ─────────────────────────────────────────────
+
+def test_load_mappings_legacy_list(tmp_path):
+    f = tmp_path / "mapping.json"
+    f.write_text('[{"from": "com.myco", "to": "com.example"}]', encoding="utf-8")
+    loaded = load_mappings(f)
+    assert loaded["package"] == [{"from": "com.myco", "to": "com.example"}]
+    assert loaded["variable"] == []
+    assert loaded["strings"] == {}
+    assert loaded["version"] == 2
+
+
+def test_load_mappings_v1_dict(tmp_path):
+    f = tmp_path / "mapping.json"
+    f.write_text('{"package": [], "variable": [{"from": "Order", "to": "Record"}], "language": "spring"}',
+                 encoding="utf-8")
+    loaded = load_mappings(f)
+    assert loaded["variable"] == [{"from": "Order", "to": "Record"}]
+    assert loaded["strings"] == {}
+    assert loaded["language"] == "spring"
+
+
+def test_save_load_mappings_v2_round_trip(tmp_path):
+    f = tmp_path / "mapping.json"
+    mapping = dict(ORDER_MAPPING, language="spring", strings={"STR_0": '"x"'})
+    save_mappings(mapping, f)
+    loaded = load_mappings(f)
+    assert loaded["version"] == 2
+    assert loaded["strings"] == {"STR_0": '"x"'}
+    assert loaded["package"] == ORDER_MAPPING["package"]

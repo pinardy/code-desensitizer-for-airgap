@@ -293,9 +293,48 @@ def test_validate_mappings_clean():
     assert validate_mappings(ORDER_MAPPING) == []
 
 
+@pytest.mark.parametrize("frm,to,src", [
+    # singularize's -us guard used to collapse Menus/Menu into one form
+    ("Menu", "Item", "List<Menu> menus = getMenus(); MENU_TYPE MENUS menu"),
+    # 'Data' used to reverse to 'Datas' (irregular singular re-derivation)
+    ("Data", "Info", "Data data = loadData(); DATA_SOURCE"),
+    # a plural 'from' used to re-pluralize the 'to' (orders -> itemses)
+    ("orders", "items", "orders order ORDERS"),
+    # all-caps acronyms used to produce aPI on reversal
+    ("API", "Gateway", "apiClient callApi(); API_KEY apis API"),
+])
+def test_round_trip_tricky_names(frm, to, src):
+    forward = {"package": [], "variable": [{"from": frm, "to": to}]}
+    backward = {"package": [], "variable": [{"from": to, "to": frm}]}
+    mapped = apply_all_mappings(src, forward)
+    assert apply_all_mappings(mapped, backward) == src
+
+
 # ─────────────────────────────────────────────
 #  String masking / unmasking
 # ─────────────────────────────────────────────
+
+def test_strip_comments_java_preserves_strings():
+    from code_extractor import strip_comments_java
+    src = ('String url = "https://internal.host/x"; // trailing comment\n'
+           '/* block */ int a = 1;\n'
+           'String glob = "src/**/*.java";\n')
+    out = strip_comments_java(src)
+    assert '"https://internal.host/x"' in out
+    assert '"src/**/*.java"' in out
+    assert "trailing comment" not in out
+    assert "block" not in out
+
+
+def test_react_import_regexes_match_multiline():
+    from code_extractor import REACT_IMPORT_RES
+    src = ("import {\n  fetchPayrolls,\n  updatePayroll,\n} from '@/features/payroll/api';\n"
+           "export {\n  PayrollList,\n} from './payroll-list';\n"
+           "import './side-effect';\n"
+           "const notAnImport = 'plain string';\n")
+    specs = {m.group(1) for rx in REACT_IMPORT_RES for m in rx.finditer(src)}
+    assert specs == {"@/features/payroll/api", "./payroll-list", "./side-effect"}
+
 
 def test_mask_unmask_java_round_trip():
     src = ('String url = "jdbc:oracle:thin:@prod-db:1521";\n'
@@ -327,6 +366,32 @@ def test_mask_java_no_catastrophic_backtracking():
     start = time.monotonic()
     mask_strings_java(src, StringMaskRegistry())
     assert time.monotonic() - start < 2.0
+
+
+def test_mask_react_export_and_after_import_strings():
+    # Strings on export lines ARE data, not specifiers — they must be masked
+    out = mask_strings_react("export const API_URL = 'https://internal.corp/api';\n",
+                             StringMaskRegistry())
+    assert "internal.corp" not in out
+    # Code after a same-line import statement is not exempt either
+    out2 = mask_strings_react("import { a } from './a'; const s = 'secret';\n",
+                              StringMaskRegistry())
+    assert "'./a'" in out2
+    assert "secret" not in out2
+
+
+def test_mask_react_multiline_dynamic_import_specifier_kept():
+    src = "const mod = await import(\n  './features/heavy'\n);\nconst x = 'mask me';\n"
+    out = mask_strings_react(src, StringMaskRegistry())
+    assert "'./features/heavy'" in out   # specifier survives across the newline
+    assert "mask me" not in out
+
+
+def test_mask_react_side_effect_import_kept():
+    out = mask_strings_react("import './styles.css';\nexport * from './barrel';\n",
+                             StringMaskRegistry())
+    assert "'./styles.css'" in out
+    assert "'./barrel'" in out
 
 
 def test_mask_unmask_react_round_trip():
@@ -723,6 +788,21 @@ def test_reverse_dry_run_writes_nothing(tmp_path):
     assert not list(tmp_path.glob("*.backup-*"))
 
 
+def test_reverse_never_moves_files_outside_target_dir(tmp_path):
+    # The mapping's 'to' name appears in an ANCESTOR segment of --dir;
+    # reversal must not rewrite it and relocate files out of the tree.
+    outer = tmp_path / "records" / "generated-tests"
+    outer.mkdir(parents=True)
+    (outer / "RecordTest.java").write_text("class RecordTest { Record r; }", encoding="utf-8")
+
+    apply_reversal(outer, dict(SPRING_MAPPING, language="spring"), LANGUAGES["spring"],
+                   backup=False)
+
+    assert (outer / "OrderTest.java").exists()          # renamed in place
+    assert not (tmp_path / "orders").exists()           # ancestor untouched
+    assert outer.parent.name == "records"
+
+
 def test_reverse_creates_backup(tmp_path):
     generated, mapping = make_generated_dir(tmp_path)
     before = tree_snapshot(generated)
@@ -767,4 +847,21 @@ def test_cli_trace_dry_run(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "Would write" in proc.stdout
     assert "No files written" in proc.stdout
+    assert not out_dir.exists()
+
+
+def test_cli_trace_missing_mapping_file_fails(tmp_path):
+    # A typo in --mapping must never silently produce unsanitized output
+    src_root = make_spring_project(tmp_path)
+    out_dir = tmp_path / "extracted"
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).parent / "code_extractor.py"), "trace",
+         "--entry", str(src_root / "com/myco/service/OrderService.java"),
+         "--base", "com.myco", "--src", str(src_root), "--out", str(out_dir),
+         "--mapping", str(tmp_path / "no_such_mapping.json")],
+        capture_output=True, text=True, encoding="utf-8", env=env, timeout=60,
+    )
+    assert proc.returncode == 1
+    assert "Mapping file not found" in proc.stdout + proc.stderr
     assert not out_dir.exists()

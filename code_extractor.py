@@ -117,11 +117,13 @@ REACT_ASSET_EXTS = {
     ".mp3", ".mp4", ".wav", ".webm",
 }
 
+# The clause before `from` may span lines (Prettier wraps named-import lists),
+# so it admits newlines but not quotes or `;` — it can never skip a statement.
 REACT_IMPORT_RES = [
-    # import X from '...'; import { A, B } from '...'; import '...'; import type X from '...'
-    re.compile(r"^[ \t]*import\s+(?:type\s+)?(?:[^'\"\n]*?\bfrom\s*)?['\"]([^'\"\n]+)['\"]", re.MULTILINE),
-    # export { A } from '...'; export * from '...'
-    re.compile(r"^[ \t]*export\s+(?:type\s+)?[^'\"\n]*?\bfrom\s*['\"]([^'\"\n]+)['\"]", re.MULTILINE),
+    # import X from '...'; import { A,\n B,\n } from '...'; import '...'; import type X from '...'
+    re.compile(r"^[ \t]*import\s+(?:type\s+)?(?:[^'\";]*?\bfrom\s*)?['\"]([^'\"\n]+)['\"]", re.MULTILINE),
+    # export { A } from '...'; export * from '...'; multiline export { ... } from '...'
+    re.compile(r"^[ \t]*export\s+(?:type\s+)?[^'\";]*?\bfrom\s*['\"]([^'\"\n]+)['\"]", re.MULTILINE),
     # require('...'), dynamic import('...')
     re.compile(r"\b(?:require|import)\(\s*['\"]([^'\"\n]+)['\"]\s*\)"),
 ]
@@ -256,6 +258,8 @@ def to_pascal_case(name: str) -> str:
 
 def to_camel_case(name: str) -> str:
     """Convert to camelCase (Ingredient → ingredient, IngredientService → ingredientService)"""
+    if name.isupper():
+        return name.lower()  # acronyms: API → api, not aPI
     pascal = to_pascal_case(name)
     return pascal[0].lower() + pascal[1:] if pascal else pascal
 
@@ -315,49 +319,37 @@ def singularize(word: str) -> str:
         return word
 
 
+def _tagged_name_variations(base_name: str) -> list:
+    """
+    (variation, number_tag) pairs across all case families, where the tag
+    records HOW the variation was derived: 'as_is' (the name as given),
+    'plural' (pluralize applied), or 'singular' (singularize applied).
+
+    Tagging at generation time is what keeps round trips exact: re-deriving
+    plurality later via singularize() misfires on names its heuristics refuse
+    (Menus, Data, APIs), which made forward and reverse mappings disagree.
+    """
+    tagged = {}
+
+    def add(form, tag):
+        if form and form not in tagged:  # first derivation wins; as_is comes first per family
+            tagged[form] = tag
+
+    for case_fn in (to_pascal_case, to_camel_case, to_upper_snake_case,
+                    to_snake_case, to_kebab_case):
+        base = case_fn(base_name)
+        add(base, "as_is")
+        add(pluralize(base), "plural")
+        add(singularize(base), "singular")
+    return list(tagged.items())
+
+
 def generate_name_variations(base_name: str) -> list:
     """
     Generate common variations of a class/variable name.
     E.g., 'Ingredient' → ['Ingredient', 'ingredient', 'ingredients', 'INGREDIENT', 'INGREDIENTS']
     """
-    variations = set()
-
-    # PascalCase forms
-    pascal = to_pascal_case(base_name)
-    variations.add(pascal)
-    variations.add(pluralize(pascal))
-    variations.add(singularize(pascal))
-
-    # camelCase forms
-    camel = to_camel_case(base_name)
-    if camel and camel != pascal:
-        variations.add(camel)
-        variations.add(pluralize(camel))
-        variations.add(singularize(camel))
-
-    # UPPER_SNAKE_CASE forms
-    upper_snake = to_upper_snake_case(base_name)
-    variations.add(upper_snake)
-    variations.add(pluralize(upper_snake))
-    variations.add(singularize(upper_snake))
-
-    # snake_case forms
-    snake = to_snake_case(base_name)
-    if snake != base_name and snake != camel.lower():
-        variations.add(snake)
-        variations.add(pluralize(snake))
-        variations.add(singularize(snake))
-
-    # kebab-case forms (React file names: ingredient-row.tsx)
-    kebab = to_kebab_case(base_name)
-    variations.add(kebab)
-    variations.add(pluralize(kebab))
-    variations.add(singularize(kebab))
-
-    # Remove empty strings and the base name itself if it's just a case variant
-    variations.discard("")
-
-    return sorted(list(variations))
+    return sorted(form for form, _ in _tagged_name_variations(base_name))
 
 
 def variable_mapping_patterns(from_name: str, to_name: str) -> list:
@@ -366,10 +358,7 @@ def variable_mapping_patterns(from_name: str, to_name: str) -> list:
     covering all name variations, word boundaries, and compound identifiers.
     """
     pairs = []
-    for from_var in generate_name_variations(from_name):
-        # Determine the correct form for the 'to' name based on the 'from' form
-        is_plural = (singularize(from_var) != from_var)
-
+    for from_var, number_tag in _tagged_name_variations(from_name):
         if from_var.isupper():
             to_var = to_upper_snake_case(to_name)
         elif "-" in from_var:
@@ -380,8 +369,10 @@ def variable_mapping_patterns(from_name: str, to_name: str) -> list:
             to_var = to_pascal_case(to_name)
         else:
             to_var = to_camel_case(to_name)
-        if is_plural:
+        if number_tag == "plural":
             to_var = pluralize(to_var)
+        elif number_tag == "singular":
+            to_var = singularize(to_var)
 
         # UPPER_SNAKE_CASE as prefix in compound names (INGREDIENT in INGREDIENT_TYPE)
         if from_var.isupper() and "_" not in from_var:
@@ -659,9 +650,19 @@ def apply_path_mappings(path_value, mapping_dict: dict, lang: dict) -> Path:
     return Path(_cached_renamer(build_path_rules(mapping_dict, lang)).apply(str(path_value)))
 
 
-def rename_source_path(file_path: Path, mapping_dict: dict, lang: dict) -> Path:
-    """Rename a source file path, including parent folders, via path mappings."""
-    renamed_path = apply_path_mappings(file_path, mapping_dict, lang)
+def rename_source_path(file_path: Path, mapping_dict: dict, lang: dict,
+                       base_dir: Path | None = None) -> Path:
+    """
+    Rename a source file path, including parent folders, via path mappings.
+    With base_dir set, only the part below base_dir is eligible — a mapping
+    name occurring in an ancestor segment must never move files out of the
+    directory being processed.
+    """
+    if base_dir is not None:
+        renamed_path = base_dir / apply_path_mappings(file_path.relative_to(base_dir),
+                                                      mapping_dict, lang)
+    else:
+        renamed_path = apply_path_mappings(file_path, mapping_dict, lang)
     if renamed_path.name == file_path.name and renamed_path.parent == file_path.parent:
         return file_path
     return renamed_path
@@ -687,11 +688,14 @@ def react_output_rel_path(module_id: str, mapping_dict: dict) -> Path:
     return apply_path_mappings(Path(module_id), mapping_dict, LANGUAGES["react"])
 
 
+# Matches a string literal (group 1, kept) or a comment (removed), so '//' or
+# '/*' inside a string literal — e.g. a URL — never truncates code.
+JAVA_COMMENT_OR_STRING_RE = re.compile(
+    r'("[^"\\\n]*(?:\\.[^"\\\n]*)*")|(?:/\*.*?\*/|//[^\n]*)', re.DOTALL)
+
+
 def strip_comments_java(source: str) -> str:
-    # Block comments (including Javadoc)
-    source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
-    # Line comments
-    source = re.sub(r"//[^\n]*", "", source)
+    source = JAVA_COMMENT_OR_STRING_RE.sub(lambda m: m.group(1) or "", source)
     # Collapse excessive blank lines
     source = re.sub(r"\n{3,}", "\n\n", source)
     return source
@@ -877,39 +881,36 @@ def strip_comments_react(source: str) -> str:
     return result
 
 
+# A string is a module specifier iff the code immediately before it ends with
+# `from`, a bare `import` (side-effect import), or an open `import(`/`require(`.
+_SPECIFIER_CONTEXT_RE = re.compile(r"(?:\bfrom|\bimport)\s*$|\b(?:require|import)\s*\(\s*$")
+
+
 def mask_strings_react(source: str, registry: StringMaskRegistry) -> str:
     """
-    Mask string literals — but never import/export/require specifiers,
-    and never template literals containing ${...} interpolation.
+    Mask string literals — but never module specifiers, and never template
+    literals containing ${...} interpolation.
+
+    Specifiers are detected from the CODE context directly preceding the
+    string (spanning newlines), not the line prefix — an `export const X =
+    '...'` must be masked, and a multiline `import(\n'...')` must not be.
     """
     out = []
-    line_tail = [""]  # text emitted since the last newline
-
-    def emit(text):
-        out.append(text)
-        nl = text.rfind("\n")
-        if nl == -1:
-            line_tail[0] += text
-        else:
-            line_tail[0] = text[nl + 1:]
+    code_tail = ""  # trailing slice of the most recently emitted CODE
 
     for kind, text in _scan_js(source):
         if kind == "string":
-            tail = line_tail[0]
-            is_specifier = (
-                re.match(r"\s*(import|export)\b", tail)
-                or re.search(r"\bfrom\s*$", tail)
-                or re.search(r"\b(require|import)\s*\(\s*$", tail)
-            )
-            if is_specifier:
-                emit(text)
+            if _SPECIFIER_CONTEXT_RE.search(code_tail):
+                out.append(text)
             else:
                 q = text[0]
-                emit(f"{q}{registry.add(text)}{q}")
+                out.append(f"{q}{registry.add(text)}{q}")
         elif kind == "template" and "${" not in text:
-            emit(f"`{registry.add(text)}`")
+            out.append(f"`{registry.add(text)}`")
         else:
-            emit(text)
+            out.append(text)
+            if kind == "code":
+                code_tail = (code_tail + text)[-200:]
 
     return "".join(out)
 
@@ -1032,7 +1033,7 @@ def apply_reversal(target_dir: Path, mapping_dict: dict, lang: dict,
                 sf.write_text(updated, encoding="utf-8")
 
     for sf in source_files:
-        renamed_path = rename_source_path(sf, reversed_maps, lang)
+        renamed_path = rename_source_path(sf, reversed_maps, lang, base_dir=target_dir)
         if renamed_path != sf:
             if renamed_path.exists():
                 print(yellow(f"  [skip] file rename collision: {sf.name} -> {renamed_path.name}"))
@@ -1578,8 +1579,13 @@ def cmd_trace(args):
     out_dir  = Path(args.out)
 
     mapping_dict = {"package": [], "variable": [], "strings": {}}
-    if args.mapping and Path(args.mapping).exists():
-        mapping_dict = load_mappings(Path(args.mapping))
+    if args.mapping:
+        mapping_path = Path(args.mapping)
+        if not mapping_path.exists():
+            # Silently continuing would write UNSANITIZED output on a path typo.
+            print(red(f"Mapping file not found: {mapping_path}"))
+            sys.exit(1)
+        mapping_dict = load_mappings(mapping_path)
         pkg_count = len(mapping_dict.get("package", []))
         var_count = len(mapping_dict.get("variable", []))
         print(green(f"Loaded {pkg_count} package mapping(s) and {var_count} variable mapping(s) from {args.mapping}"))

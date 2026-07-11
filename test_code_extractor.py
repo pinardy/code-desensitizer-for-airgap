@@ -1,6 +1,10 @@
 """Tests for code_extractor.py — run with `python -m pytest test_code_extractor.py -q`."""
 
+import os
 import re
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +24,7 @@ from code_extractor import (
     build_path_rules,
     validate_mappings,
     apply_all_mappings,
+    apply_path_mappings,
     apply_variable_mappings,
     LANGUAGES,
     StringMaskRegistry,
@@ -28,6 +33,11 @@ from code_extractor import (
     unmask_strings,
     load_mappings,
     save_mappings,
+    trace,
+    write_extracted,
+    apply_reversal,
+    parse_inline_mappings,
+    REVERSAL_MARKER,
 )
 
 
@@ -385,3 +395,372 @@ def test_save_load_mappings_v2_round_trip(tmp_path):
     assert loaded["version"] == 2
     assert loaded["strings"] == {"STR_0": '"x"'}
     assert loaded["package"] == ORDER_MAPPING["package"]
+
+
+def test_parse_inline_mappings():
+    assert parse_inline_mappings(["com.myco=com.example", "Order=Rec=ord"], "--map-var") == [
+        {"from": "com.myco", "to": "com.example"},
+        {"from": "Order", "to": "Rec=ord"},   # split on FIRST '='
+    ]
+    assert parse_inline_mappings(None, "--map-var") == []
+    with pytest.raises(SystemExit):
+        parse_inline_mappings(["no-separator"], "--map-var")
+    with pytest.raises(SystemExit):
+        parse_inline_mappings(["=empty-from"], "--map-var")
+
+
+# ─────────────────────────────────────────────
+#  Integration fixtures
+# ─────────────────────────────────────────────
+
+SPRING_FILES = {
+    "com/myco/service/OrderService.java": """\
+package com.myco.service;
+
+import com.myco.repo.OrderRepository;
+import com.myco.model.Order;
+import com.myco.model.OrderStatus;
+import com.myco2.external.Billing;
+import java.util.List;
+
+/**
+ * Handles orders.
+ * @author someone
+ */
+public class OrderService {
+    private static final String ORDER_TOPIC = "queue.com.myco.orders";
+    private final OrderRepository orderRepository;
+
+    public List<Order> findOrders(long orderId) {
+        log.info("loading order {}", orderId);
+        // Ordering matters here
+        Order myOrder = orderRepository.findById(orderId);
+        return List.of(myOrder);
+    }
+}
+""",
+    "com/myco/repo/OrderRepository.java": """\
+package com.myco.repo;
+
+import com.myco.model.Order;
+
+public interface OrderRepository {
+    Order findById(long orderId);
+}
+""",
+    "com/myco/model/Order.java": """\
+package com.myco.model;
+
+import com.myco.model.OrderStatus;
+
+public class Order {
+    private OrderStatus orderStatus;
+    private String note = "orders are precious";
+}
+""",
+    "com/myco/model/OrderStatus.java": """\
+package com.myco.model;
+
+public enum OrderStatus { NEW, SHIPPED }
+""",
+}
+
+SPRING_MAPPING = {
+    "package": [{"from": "com.myco", "to": "com.example"}],
+    "variable": [{"from": "Order", "to": "Record"}],
+    "strings": {},
+}
+
+REACT_FILES = {
+    "features/payroll/PayrollList.tsx": """\
+import { useState } from 'react';
+import { usePayroll } from './usePayroll';
+import { fetchPayrolls } from '@/features/payroll/api/payrollApi';
+import { Payroll } from './types';
+import { missing } from './missing';
+
+export function PayrollList() {
+    {/* payroll table */}
+    const { payrolls } = usePayroll();
+    const label = 'Payroll run';
+    const tpl = `static payroll template`;
+    const dynamic = `count: ${payrolls.length}`;
+    console.log('rendering payroll list');
+    return <div>{label}</div>;
+}
+""",
+    "features/payroll/usePayroll.ts": """\
+import { fetchPayrolls } from '@/features/payroll/api/payrollApi';
+import { Payroll } from './types';
+
+export function usePayroll() {
+    const payrolls: Payroll[] = [];
+    return { payrolls };
+}
+""",
+    "features/payroll/api/payrollApi.ts": """\
+import { Payroll } from '../types';
+
+export async function fetchPayrolls(): Promise<Payroll[]> {
+    const url = '/api/payrolls';
+    return [];
+}
+""",
+    "features/payroll/types/index.ts": """\
+export interface Payroll {
+    payrollId: string;
+    PAYROLL_STATUS: string;
+}
+""",
+}
+
+REACT_MAPPING = {
+    "package": [{"from": "features/payroll", "to": "features/feature1"}],
+    "variable": [{"from": "Payroll", "to": "Widget"}],
+    "strings": {},
+}
+
+NO_STRIP = {"strip_comments": False, "strip_javadoc": False,
+            "mask_strings": False, "strip_loggers": False}
+
+
+def make_spring_project(tmp_path: Path) -> Path:
+    src_root = tmp_path / "src" / "main" / "java"
+    for rel, content in SPRING_FILES.items():
+        f = src_root / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(content, encoding="utf-8")
+    return src_root
+
+
+def make_react_project(tmp_path: Path) -> Path:
+    src_root = tmp_path / "src"
+    for rel, content in REACT_FILES.items():
+        f = src_root / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(content, encoding="utf-8")
+    return src_root
+
+
+def tree_snapshot(root: Path) -> dict:
+    return {p.relative_to(root).as_posix(): p.read_bytes()
+            for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def assert_fully_sanitized(out_dir: Path, mapping: dict, lang: dict):
+    """
+    A sanitized tree is a fixed point of the mapping: applying it again must
+    change nothing, in any file's content or path. (Near-misses like com.myco2
+    or 'Ordering' are intentionally untouched, so substring checks don't apply.)
+    """
+    for p in out_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(out_dir).as_posix()
+        assert str(apply_path_mappings(rel, mapping, lang)) == rel.replace("/", os.sep) \
+            or str(apply_path_mappings(rel, mapping, lang)) == rel, \
+            f"path not fully sanitized: {rel}"
+        if p.suffix in (".java", ".ts", ".tsx", ".js", ".jsx"):
+            content = p.read_text(encoding="utf-8")
+            assert apply_all_mappings(content, mapping) == content, \
+                f"content not fully sanitized: {rel}"
+
+
+# ─────────────────────────────────────────────
+#  Integration: trace → sanitize → reverse
+# ─────────────────────────────────────────────
+
+def test_spring_trace_and_sanitize(tmp_path, capsys):
+    src_root = make_spring_project(tmp_path)
+    entry = src_root / "com/myco/service/OrderService.java"
+    deps = trace(entry, "com.myco", src_root, LANGUAGES["spring"])
+
+    assert set(deps) == {"com.myco.service.OrderService", "com.myco.repo.OrderRepository",
+                         "com.myco.model.Order", "com.myco.model.OrderStatus"}
+    # com.myco2.* must not be traced (dot-boundary on the base package)
+    assert not any("myco2" in mid for mid in deps)
+
+    out_dir = tmp_path / "extracted"
+    registry = StringMaskRegistry()
+    options = {"strip_comments": True, "strip_javadoc": True,
+               "mask_strings": True, "strip_loggers": True}
+    write_extracted(deps, SPRING_MAPPING, options, out_dir, LANGUAGES["spring"], registry)
+
+    assert_fully_sanitized(out_dir, SPRING_MAPPING, LANGUAGES["spring"])
+    assert (out_dir / "com/example/service/RecordService.java").exists()
+    assert (out_dir / "com/example/model/RecordStatus.java").exists()
+    # masked strings recorded with sanitized content
+    assert any("queue.com.example.records" in v for v in registry.to_dict().values())
+
+
+def test_react_trace_and_sanitize(tmp_path):
+    src_root = make_react_project(tmp_path)
+    entry = src_root / "features/payroll/PayrollList.tsx"
+    deps = trace(entry, "@", src_root, LANGUAGES["react"])
+
+    found = {mid for mid, info in deps.items() if info["path"] is not None}
+    assert found == {"features/payroll/PayrollList.tsx", "features/payroll/usePayroll.ts",
+                     "features/payroll/api/payrollApi.ts", "features/payroll/types/index.ts"}
+    missing = {mid for mid, info in deps.items() if info["path"] is None}
+    assert missing == {"features/payroll/missing"}
+
+    out_dir = tmp_path / "extracted"
+    registry = StringMaskRegistry()
+    options = {"strip_comments": True, "strip_javadoc": True,
+               "mask_strings": True, "strip_loggers": True}
+    write_extracted(deps, REACT_MAPPING, options, out_dir, LANGUAGES["react"], registry)
+
+    assert_fully_sanitized(out_dir, REACT_MAPPING, LANGUAGES["react"])
+    assert (out_dir / "features/feature1/WidgetList.tsx").exists()
+    assert (out_dir / "features/feature1/useWidget.ts").exists()
+    # import specifiers were renamed, not masked
+    content = (out_dir / "features/feature1/WidgetList.tsx").read_text(encoding="utf-8")
+    assert "'@/features/feature1/api/widgetApi'" in content
+    # interpolated template kept (renamed), static strings masked
+    assert "${widgets.length}" in content
+
+
+@pytest.mark.parametrize("lang_key,builder,entry_rel,scope,mapping", [
+    ("spring", make_spring_project, "com/myco/service/OrderService.java", "com.myco",
+     SPRING_MAPPING),
+    ("react", make_react_project, "features/payroll/PayrollList.tsx", "@",
+     REACT_MAPPING),
+])
+def test_full_round_trip(tmp_path, lang_key, builder, entry_rel, scope, mapping):
+    """sanitize (no strips, masking on) → reverse → byte-identical restoration."""
+    lang = LANGUAGES[lang_key]
+    src_root = builder(tmp_path)
+    originals = tree_snapshot(src_root)
+
+    deps = trace(src_root / entry_rel, scope, src_root, lang)
+    out_dir = tmp_path / "extracted"
+    registry = StringMaskRegistry()
+    options = dict(NO_STRIP, mask_strings=True)
+    write_extracted(deps, mapping, options, out_dir, lang, registry)
+    assert_fully_sanitized(out_dir, mapping, lang)
+
+    full_mapping = dict(mapping, strings=registry.to_dict(), language=lang_key)
+    result = apply_reversal(out_dir, full_mapping, lang, backup=False)
+    assert result["warnings"] == []
+    assert result["strings_restored"] > 0
+
+    restored = {rel: content for rel, content in tree_snapshot(out_dir).items()
+                if rel != REVERSAL_MARKER}
+    # every traced original file came back under its original relative path
+    traced_rel = {info["path"].relative_to(src_root).as_posix()
+                  for info in deps.values() if info["path"] is not None}
+    assert set(restored) == traced_rel
+    for rel, content in restored.items():
+        # sanitize() strips outer whitespace; content must otherwise be identical
+        assert content.decode("utf-8") == originals[rel].decode("utf-8").strip(), f"mismatch in {rel}"
+
+
+def test_reversal_of_ai_generated_test_file(tmp_path):
+    generated = tmp_path / "generated-tests"
+    generated.mkdir()
+    (generated / "RecordServiceTest.java").write_text(
+        'package com.example.service;\n'
+        'import com.example.model.Record;\n'
+        'class RecordServiceTest {\n'
+        '    Record myRecord; long recordId;\n'
+        '    String topic = "STR_0";\n'
+        "    String other = 'STR_1';\n"
+        '}\n', encoding="utf-8")
+
+    mapping = dict(SPRING_MAPPING,
+                   strings={"STR_0": '"queue.com.example.records"', "STR_1": '"plain"'},
+                   language="spring")
+    result = apply_reversal(generated, mapping, LANGUAGES["spring"], backup=False)
+
+    restored_file = generated / "OrderServiceTest.java"
+    assert restored_file.exists()
+    content = restored_file.read_text(encoding="utf-8")
+    assert "package com.myco.service;" in content
+    assert "Order myOrder; long orderId;" in content
+    # string restored, then un-renamed back to the original sensitive value
+    assert '"queue.com.myco.orders"' in content
+    assert '"plain"' in content
+    assert result["strings_restored"] == 2
+
+
+def test_reverse_twice_refused_and_force_is_noop(tmp_path):
+    generated = tmp_path / "generated-tests"
+    generated.mkdir()
+    (generated / "RecordTest.java").write_text("class RecordTest { Record r; }", encoding="utf-8")
+    mapping = dict(SPRING_MAPPING, language="spring")
+
+    first = apply_reversal(generated, mapping, LANGUAGES["spring"], backup=False)
+    assert first["changed"]
+    snapshot = tree_snapshot(generated)
+
+    second = apply_reversal(generated, mapping, LANGUAGES["spring"], backup=False)
+    assert any("already reversed" in w for w in second["warnings"])
+    assert tree_snapshot(generated) == snapshot
+
+    forced = apply_reversal(generated, mapping, LANGUAGES["spring"], backup=False, force=True)
+    assert forced["changed"] == []      # engine is idempotent — nothing left to change
+    files_only = {k: v for k, v in tree_snapshot(generated).items() if k != REVERSAL_MARKER}
+    assert files_only == {k: v for k, v in snapshot.items() if k != REVERSAL_MARKER}
+
+
+def test_reverse_dry_run_writes_nothing(tmp_path):
+    generated = tmp_path / "generated-tests"
+    generated.mkdir()
+    (generated / "RecordTest.java").write_text("class RecordTest { Record r; }", encoding="utf-8")
+    mapping = dict(SPRING_MAPPING, language="spring")
+
+    before = tree_snapshot(generated)
+    result = apply_reversal(generated, mapping, LANGUAGES["spring"], dry_run=True)
+    assert result["changed"] and result["renamed"]
+    assert tree_snapshot(generated) == before
+    assert not (generated / REVERSAL_MARKER).exists()
+    assert not list(tmp_path.glob("*.backup-*"))
+
+
+def test_reverse_creates_backup(tmp_path):
+    generated = tmp_path / "generated-tests"
+    generated.mkdir()
+    (generated / "RecordTest.java").write_text("class RecordTest { Record r; }", encoding="utf-8")
+    before = tree_snapshot(generated)
+
+    apply_reversal(generated, dict(SPRING_MAPPING, language="spring"), LANGUAGES["spring"])
+    backups = list(tmp_path.glob("generated-tests.backup-*"))
+    assert len(backups) == 1
+    assert tree_snapshot(backups[0]) == before
+
+
+def test_sanitized_output_is_idempotent(tmp_path):
+    src_root = make_spring_project(tmp_path)
+    deps = trace(src_root / "com/myco/service/OrderService.java", "com.myco", src_root,
+                 LANGUAGES["spring"])
+    out1 = tmp_path / "out1"
+    out2 = tmp_path / "out2"
+    write_extracted(deps, SPRING_MAPPING, NO_STRIP, out1, LANGUAGES["spring"])
+
+    # sanitize the sanitized output again: re-trace from the extracted tree
+    deps2 = trace(out1 / "com/example/service/RecordService.java", "com.example", out1,
+                  LANGUAGES["spring"])
+    write_extracted(deps2, SPRING_MAPPING, NO_STRIP, out2, LANGUAGES["spring"])
+    assert tree_snapshot(out1) == tree_snapshot(out2)
+
+
+# ─────────────────────────────────────────────
+#  CLI smoke test
+# ─────────────────────────────────────────────
+
+def test_cli_trace_dry_run(tmp_path):
+    src_root = make_spring_project(tmp_path)
+    out_dir = tmp_path / "extracted"
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).parent / "code_extractor.py"), "trace",
+         "--entry", str(src_root / "com/myco/service/OrderService.java"),
+         "--base", "com.myco", "--src", str(src_root), "--out", str(out_dir),
+         "--map-package", "com.myco=com.example", "--map-var", "Order=Record",
+         "--mask-strings", "--dry-run"],
+        capture_output=True, text=True, encoding="utf-8", env=env, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "Would write" in proc.stdout
+    assert "No files written" in proc.stdout
+    assert not out_dir.exists()

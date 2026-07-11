@@ -83,7 +83,7 @@ def java_find_deps(source: str, file_path: Path, scope: str, src_root: Path) -> 
     deps = []
     for m in IMPORT_RE.finditer(source):
         fqn = m.group(1)
-        if not fqn.startswith(scope):
+        if not fqn.startswith(scope + "."):  # dot boundary: com.myco must not capture com.myco2.*
             continue
         class_name = fqn.split(".")[-1]
         if class_name == "*" or not class_name[0].isupper():

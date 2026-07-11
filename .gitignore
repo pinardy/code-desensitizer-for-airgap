@@ -1,0 +1,18 @@
+# Sanitizer output — contains re-identifiable content; never commit
+extracted/
+generated-tests/
+
+# The mapping file is the decoder ring back to sensitive names — never commit
+mapping.json
+
+# Reversal safety artifacts
+*.backup-*/
+.code_extractor_reversed.json
+
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Demo / scratch
+demo/

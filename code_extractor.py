@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Code Extractor & Sanitizer (Spring Boot Java / React)
-------------------------------------------------------
+Code Extractor & Sanitizer (Spring Boot Java / React / Angular)
+----------------------------------------------------------------
 Traces dependencies from an entry source file, sanitizes sensitive package/path
 and class/variable names, and produces a reversal script to undo mappings on
 generated test files.
@@ -9,6 +9,7 @@ generated test files.
 Usage:
   python code_extractor.py trace   --entry path/to/MyService.java --base com.mycompany --src src/main/java --out ./extracted
   python code_extractor.py trace   --entry src/components/MyWidget.tsx --lang react --src src --out ./extracted
+  python code_extractor.py trace   --entry src/app/widget/widget.component.ts --lang angular --src src --out ./extracted
   python code_extractor.py reverse --mapping mapping.json --dir ./generated-tests
   python code_extractor.py         (interactive menu)
 
@@ -223,6 +224,103 @@ def classify_react(module_id: str, source: str) -> str:
         return "component"
     if re.search(r"\b(axios|fetch)\s*[.(]", source):
         return "api"
+    return "module"
+
+
+# ─────────────────────────────────────────────
+#  Angular import / resource parsing
+# ─────────────────────────────────────────────
+
+ANGULAR_RESOURCE_EXTS = {".html", ".css", ".scss", ".sass", ".less", ".styl"}
+
+# Component resources are not TypeScript imports, so Angular needs an
+# additional pass over @Component metadata. These expressions intentionally
+# accept only literal paths; computed metadata cannot be resolved statically.
+ANGULAR_RESOURCE_SCALAR_RE = re.compile(
+    r"\b(?:templateUrl|styleUrl)\s*:\s*['\"]([^'\"\n]+)['\"]"
+)
+ANGULAR_STYLE_URLS_RE = re.compile(r"\bstyleUrls\s*:\s*\[(.*?)\]", re.DOTALL)
+ANGULAR_QUOTED_VALUE_RE = re.compile(r"['\"]([^'\"\n]+)['\"]")
+
+
+def angular_module_id(source: str, file_path: Path, src_root: Path) -> str:
+    """Module identity for Angular: the source-root-relative path."""
+    return react_module_id(source, file_path, src_root)
+
+
+def _angular_resource_specs(source: str) -> list[str]:
+    """Return literal template/style paths referenced by Angular metadata."""
+    specs = [m.group(1) for m in ANGULAR_RESOURCE_SCALAR_RE.finditer(source)]
+    for array_match in ANGULAR_STYLE_URLS_RE.finditer(source):
+        specs.extend(m.group(1) for m in ANGULAR_QUOTED_VALUE_RE.finditer(array_match.group(1)))
+    # Preserve declaration order while avoiding duplicate work.
+    return list(dict.fromkeys(specs))
+
+
+def _angular_resource_dependency(spec: str, importing_file: Path,
+                                 src_root: Path) -> tuple[str, Path | None] | None:
+    """Resolve a relative Angular template/style reference below src_root."""
+    if not spec.startswith(".") or Path(spec).suffix.lower() not in ANGULAR_RESOURCE_EXTS:
+        return None
+
+    candidate = (importing_file.parent / spec).resolve()
+    try:
+        module_id = candidate.relative_to(src_root.resolve()).as_posix()
+    except ValueError:
+        # Referenced outside the source root: we deliberately don't extract it,
+        # but keep it visible as an unresolved (✗) dependency rather than
+        # dropping it silently — mirroring how out-of-project TS imports are
+        # surfaced. The sanitized component still references this path.
+        return spec, None
+    return module_id, candidate if candidate.is_file() else None
+
+
+def angular_find_deps(source: str, file_path: Path, scope: str,
+                      src_root: Path) -> list:
+    """Trace Angular TypeScript imports plus @Component template/style files."""
+    if file_path.suffix.lower() != ".ts":
+        return []
+
+    deps = react_find_deps(source, file_path, scope, src_root)
+    known_ids = {module_id for module_id, _ in deps}
+    for spec in _angular_resource_specs(source):
+        dependency = _angular_resource_dependency(spec, file_path, src_root)
+        if dependency is not None and dependency[0] not in known_ids:
+            deps.append(dependency)
+            known_ids.add(dependency[0])
+    return deps
+
+
+def classify_angular(module_id: str, source: str) -> str:
+    """Classify Angular source and component-resource files for the checklist."""
+    path = module_id.lower()
+    # Any HTML/stylesheet resource is a template/style — including shared ones
+    # referenced by more than one component — so a plain .scss is never
+    # mistaken for a module (and listed as a mock collaborator in the prompt).
+    if path.endswith(".html"):
+        return "template"
+    if any(path.endswith(ext) for ext in ANGULAR_RESOURCE_EXTS - {".html"}):
+        return "style"
+    if path.endswith((".routing.module.ts", ".routes.ts")):
+        return "routing"
+    for suffix, kind in (
+        (".component.ts", "component"),
+        (".service.ts", "service"),
+        (".module.ts", "ngmodule"),
+        (".directive.ts", "directive"),
+        (".pipe.ts", "pipe"),
+        (".guard.ts", "guard"),
+        (".resolver.ts", "resolver"),
+        (".interceptor.ts", "interceptor"),
+    ):
+        if path.endswith(suffix):
+            return kind
+    if path.endswith((".actions.ts", ".reducer.ts", ".effects.ts", ".selectors.ts")):
+        return "state"
+    if path.endswith((".model.ts", ".models.ts", ".types.ts", ".d.ts")):
+        return "types"
+    if any(segment in path.split("/") for segment in ("utils", "util", "helpers")):
+        return "util"
     return "module"
 
 
@@ -919,8 +1017,203 @@ def strip_loggers_react(source: str) -> str:
     return re.sub(r"[ \t]*console\.(log|info|warn|error|debug|trace)\([^;\n]*\);?\n?", "\n", source)
 
 
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+STYLESHEET_COMMENT_OR_STRING_RE = re.compile(
+    r'("[^"\\]*(?:\\.[^"\\]*)*")'
+    r"|('[^'\\]*(?:\\.[^'\\]*)*')"
+    r"|(/\*.*?\*/)"
+    # SCSS/Sass/Less `//` line comments — both full-line and trailing
+    # (`color: red; // note`). Only fire when the `//` starts a line or is
+    # preceded by whitespace/`;`/`{`/`}`, so URL schemes like `http://` inside
+    # an unquoted `url(...)` are left intact.
+    r"|(^[ \t]*//[^\n]*|(?<=[ \t;{}])//[^\n]*)",
+    re.DOTALL | re.MULTILINE,
+)
+
+# Angular metadata strings carry structural information needed to understand
+# and compile the extracted feature. They are renamed by the normal mapping
+# pass, but deliberately not replaced with opaque STR_n placeholders.
+#
+# CRITICAL: these key-based exemptions are only safe when the string is
+# genuinely inside an Angular metadata decorator argument (@Component(...),
+# @Directive(...), @Pipe(...), @Injectable(...), @NgModule(...)). Applied to
+# arbitrary code they would fail open — `{ name: 'secret' }`, `db.query('...')`
+# and `cond ? name : 'secret'` all superficially match these key/call shapes.
+# `mask_strings_angular_typescript` gates every exemption below on real
+# decorator context tracked by `_AngularDecoratorContext`.
+ANGULAR_STRUCTURAL_SCALAR_RE = re.compile(
+    r"\b(?:selector|template|templateUrl|styleUrl|path|redirectTo|outlet|"
+    r"providedIn|name|alias)\s*:\s*$"
+)
+# Only strings that are direct arguments to an Angular property decorator,
+# e.g. @Input('alias') — this shape is self-anchored to the `@Decorator(`
+# token, so it is safe to honour regardless of the surrounding span.
+ANGULAR_DECORATOR_STRING_RE = re.compile(
+    r"@(?:Input|Output|HostBinding|HostListener|Attribute)\s*\(\s*$"
+)
+# Angular animation DSL calls (trigger/state/transition/query). These only
+# carry structural meaning inside an @Component animations: array, so the
+# masker requires an enclosing decorator span before honouring them.
+ANGULAR_ANIMATION_STRING_RE = re.compile(
+    r"\b(?:trigger|state|transition|query)\s*\(\s*$"
+)
+# Metadata decorators whose argument object is the only place the key-based
+# exemptions above are trusted.
+ANGULAR_METADATA_DECORATOR_RE = re.compile(
+    r"@(?:Component|Directive|Pipe|Injectable|NgModule)\s*$"
+)
+# A `styles`/`styleUrls` key immediately preceding an opening `[`.
+ANGULAR_STYLE_ARRAY_KEY_RE = re.compile(r"\b(?:styles|styleUrls)\s*:\s*$")
+
+
+class _AngularDecoratorContext:
+    """
+    Tracks, while walking a file's JS/TS *code* segments left-to-right,
+    whether the current position sits inside an Angular metadata decorator
+    argument (``@Component(...)`` and friends) and, more precisely, inside a
+    ``styles``/``styleUrls`` array within one.
+
+    String-masking exemptions are scoped to these spans so that ordinary
+    TypeScript — generic object literals, method calls, ternaries — is masked
+    normally instead of leaking through key/call-shaped regexes.
+    """
+
+    def __init__(self):
+        self._paren_depth = 0
+        self._decorator_paren_depth = None  # paren depth of the open decorator arg
+        self._bracket_base = 0              # bracket-stack size when the span opened
+        self._bracket_stack = []            # one bool per open '[': True = style array
+        self._tail = ""                     # recent code, for token lookbehind
+
+    @property
+    def in_decorator(self) -> bool:
+        return self._decorator_paren_depth is not None
+
+    @property
+    def in_style_array(self) -> bool:
+        return self.in_decorator and any(self._bracket_stack)
+
+    def feed_code(self, text: str):
+        """Advance the context state over one CODE segment."""
+        for ch in text:
+            if ch == "(":
+                self._paren_depth += 1
+                if (self._decorator_paren_depth is None
+                        and ANGULAR_METADATA_DECORATOR_RE.search(self._tail)):
+                    self._decorator_paren_depth = self._paren_depth
+                    self._bracket_base = len(self._bracket_stack)
+            elif ch == ")":
+                if (self._decorator_paren_depth is not None
+                        and self._paren_depth == self._decorator_paren_depth):
+                    # Leaving the decorator argument — fail closed on any
+                    # style arrays that were still open inside it.
+                    self._decorator_paren_depth = None
+                    del self._bracket_stack[self._bracket_base:]
+                self._paren_depth = max(0, self._paren_depth - 1)
+            elif ch == "[":
+                is_style = bool(self.in_decorator
+                                and ANGULAR_STYLE_ARRAY_KEY_RE.search(self._tail))
+                self._bracket_stack.append(is_style)
+            elif ch == "]":
+                if self._bracket_stack:
+                    self._bracket_stack.pop()
+            self._tail = (self._tail + ch)[-64:]
+
+
+def strip_comments_angular_html(source: str) -> str:
+    """Remove HTML comments while leaving Angular bindings untouched."""
+    result = HTML_COMMENT_RE.sub("", source)
+    result = re.sub(r"[ \t]+\n", "\n", result)
+    return re.sub(r"\n{3,}", "\n\n", result)
+
+
+def strip_comments_stylesheet(source: str) -> str:
+    """Remove CSS/SCSS comments without treating URL text as a comment."""
+    result = STYLESHEET_COMMENT_OR_STRING_RE.sub(
+        lambda match: match.group(1) or match.group(2) or "", source
+    )
+    result = re.sub(r"[ \t]+\n", "\n", result)
+    return re.sub(r"\n{3,}", "\n\n", result)
+
+
+def mask_strings_angular_typescript(source: str,
+                                    registry: StringMaskRegistry) -> str:
+    """
+    Mask Angular TypeScript literals while preserving imports and framework
+    metadata that links components, templates, styles, and routes.
+    """
+    out = []
+    code_tail = ""
+    ctx = _AngularDecoratorContext()
+
+    def is_structural() -> bool:
+        # Style arrays are self-identifying; scalar keys and animation calls
+        # are only trusted inside a real @Component/@Directive/... span, so
+        # generic `name:`/`path:`/`.query(` in ordinary code still gets masked.
+        if ctx.in_style_array:
+            return True
+        return ctx.in_decorator and (
+            ANGULAR_STRUCTURAL_SCALAR_RE.search(code_tail) or
+            ANGULAR_ANIMATION_STRING_RE.search(code_tail))
+
+    for kind, segment in _scan_js(source):
+        if kind == "string":
+            if (_SPECIFIER_CONTEXT_RE.search(code_tail)
+                    or ANGULAR_DECORATOR_STRING_RE.search(code_tail)
+                    or is_structural()):
+                out.append(segment)
+            else:
+                quote = segment[0]
+                out.append(f"{quote}{registry.add(segment)}{quote}")
+        elif kind == "template":
+            if "${" in segment or is_structural():
+                out.append(segment)
+            else:
+                out.append(f"`{registry.add(segment)}`")
+        else:
+            out.append(segment)
+            if kind == "code":
+                code_tail = (code_tail + segment)[-500:]
+                ctx.feed_code(segment)
+    return "".join(out)
+
+
+def sanitize_angular(source: str, mapping_dict: dict, options: dict,
+                     registry: StringMaskRegistry | None,
+                     source_path: Path | None) -> str:
+    """Sanitize Angular TypeScript, templates, and component styles by file type."""
+    if options.get("mask_strings") and registry is None:
+        raise ValueError("mask_strings requires a StringMaskRegistry — "
+                         "masking without recording the originals is irreversible")
+
+    source = apply_all_mappings(source, mapping_dict)
+    suffix = source_path.suffix.lower() if source_path else ".ts"
+    if suffix == ".html":
+        if options.get("strip_comments"):
+            source = strip_comments_angular_html(source)
+        # HTML attributes and text are not programming-language string
+        # literals. Known protected terms are still replaced by mappings.
+    elif suffix in ANGULAR_RESOURCE_EXTS:
+        if options.get("strip_comments"):
+            source = strip_comments_stylesheet(source)
+    else:
+        if options.get("strip_comments"):
+            source = strip_comments_react(source)
+        if options.get("strip_javadoc"):
+            source = strip_javadoc_tags(source)
+        if options.get("mask_strings"):
+            source = mask_strings_angular_typescript(source, registry)
+        if options.get("strip_loggers"):
+            source = strip_loggers_react(source)
+    return source.strip()
+
+
 def sanitize(source: str, mapping_dict: dict, options: dict, lang: dict,
-             registry: StringMaskRegistry | None = None) -> str:
+             registry: StringMaskRegistry | None = None,
+             source_path: Path | None = None) -> str:
+    if lang.get("sanitize_source"):
+        return lang["sanitize_source"](source, mapping_dict, options,
+                                       registry, source_path)
     # Masking runs after renaming, so recorded literals contain sanitized names.
     # Reversal unmasks first, then un-renames — restoring the originals exactly.
     if options.get("mask_strings") and registry is None:
@@ -1124,6 +1417,36 @@ Here are the sanitized source files:
 """
 
 
+def angular_prompt_template(deps: dict, mapping_dict: dict,
+                            test_framework: str = None) -> str:
+    var_mappings = mapping_dict.get("variable", [])
+    dependencies = []
+    excluded_types = {"component", "template", "style"}
+    for module_id, info in deps.items():
+        if info["type"] in excluded_types:
+            continue
+        name = Path(module_id).name.split(".")[0]
+        sanitized = apply_variable_mappings(name, var_mappings)
+        if sanitized not in dependencies:
+            dependencies.append(sanitized)
+    return f"""I have an Angular component/service/module I need unit tests for.
+
+Please generate comprehensive unit tests using Jasmine and Angular TestBed.
+
+Requirements:
+- Use TestBed for Angular components and dependency injection
+- Cover: happy paths, edge cases, validation, loading/error states, and observable behavior
+- Test component inputs, outputs, user interactions, and rendered template behavior where applicable
+- Mock injected services and collaborators: {', '.join(dependencies) if dependencies else '[see files below]'}
+- Use HttpTestingController when the code uses HttpClient; make no real network calls
+- Keep tests isolated from unrelated application modules
+
+Here are the sanitized source files, including referenced templates and styles:
+
+[paste the contents of each extracted file below this line]
+"""
+
+
 # ─────────────────────────────────────────────
 #  Language registry
 # ─────────────────────────────────────────────
@@ -1149,17 +1472,54 @@ REACT_TYPE_LABELS = {
     "module":    "Other modules",
 }
 
+ANGULAR_TYPE_ORDER = [
+    "component", "template", "style", "service", "ngmodule", "routing",
+    "directive", "pipe", "guard", "resolver", "interceptor", "state",
+    "types", "util", "module",
+]
+ANGULAR_TYPE_LABELS = {
+    "component":   "Components",
+    "template":    "Component templates",
+    "style":       "Component styles",
+    "service":     "Services",
+    "ngmodule":    "Angular modules",
+    "routing":     "Routing",
+    "directive":   "Directives",
+    "pipe":        "Pipes",
+    "guard":       "Route guards",
+    "resolver":    "Route resolvers",
+    "interceptor": "HTTP interceptors",
+    "state":       "State management",
+    "types":       "Types / models",
+    "util":        "Utilities / helpers",
+    "module":      "Other modules",
+}
+
 
 def _java_pkg_path_variants(frm: str, to: str) -> list:
     return [(frm.replace(".", os.sep), to.replace(".", os.sep))]
 
 
 def _react_pkg_path_variants(frm: str, to: str) -> list:
-    variants = [(frm, to)]
-    alt = (frm.replace("/", os.sep), to.replace("/", os.sep))
-    if alt != variants[0]:
-        variants.append(alt)
-    return variants
+    """Emit POSIX and Windows separator variants unconditionally, so a tree
+    sanitized on one OS still renames correctly when reversed on the other
+    (rather than depending on the host's os.sep)."""
+    candidates = [
+        (frm, to),
+        (frm.replace("/", os.sep), to.replace("/", os.sep)),
+        (frm.replace("/", "\\"), to.replace("/", "\\")),
+    ]
+    return list(dict.fromkeys(candidates))
+
+
+def _angular_pkg_path_variants(frm: str, to: str) -> list:
+    """Angular paths may be exchanged between Windows and POSIX machines."""
+    candidates = [
+        (frm, to),
+        (frm.replace("/", os.sep), to.replace("/", os.sep)),
+        (frm.replace("/", "\\"), to.replace("/", "\\")),
+    ]
+    return list(dict.fromkeys(candidates))
 
 
 LANGUAGES = {
@@ -1213,12 +1573,46 @@ LANGUAGES = {
         "pkg_path_variants": _react_pkg_path_variants,
         "prompt_template":   react_prompt_template,
     },
+    "angular": {
+        "key":               "angular",
+        "label":             "Angular (TypeScript)",
+        "extensions":        [".ts", ".html", ".css", ".scss", ".sass", ".less", ".styl"],
+        "default_src":       "src",
+        "src_markers":       [f"{os.sep}src{os.sep}", "/src/", "\\src\\"],
+        "entry_hint":        ".component.ts/.service.ts/.module.ts/.ts",
+        "pkg_mapping_title": "Path / module segment mappings",
+        "pkg_mapping_hint":  "e.g. app/payroll → app/feature1",
+        "doc_tag_label":     "JSDoc",
+        "logger_label":      "console.* statements",
+        "module_id":         angular_module_id,
+        "find_deps":         angular_find_deps,
+        "id_to_rel_path":    lambda mid: mid,
+        "output_rel_path":   react_output_rel_path,
+        "classify":          classify_angular,
+        "type_order":        ANGULAR_TYPE_ORDER,
+        "type_labels":       ANGULAR_TYPE_LABELS,
+        "strip_comments":    strip_comments_react,
+        "strip_doc_tags":    strip_javadoc_tags,
+        "mask_strings":      mask_strings_angular_typescript,
+        "strip_loggers":     strip_loggers_react,
+        "pkg_path_variants": _angular_pkg_path_variants,
+        "prompt_template":   angular_prompt_template,
+        "sanitize_source":   sanitize_angular,
+    },
 }
 
 DEFAULT_LANG = "spring"
 
 
 def infer_language(entry: str) -> str:
+    lower_name = Path(entry).name.lower()
+    angular_suffixes = (
+        ".component.ts", ".service.ts", ".module.ts", ".directive.ts",
+        ".pipe.ts", ".guard.ts", ".resolver.ts", ".interceptor.ts",
+        ".routes.ts",
+    )
+    if lower_name.endswith(angular_suffixes):
+        return "angular"
     ext = Path(entry).suffix.lower()
     for key, lang_def in LANGUAGES.items():
         if ext in lang_def["extensions"]:
@@ -1263,7 +1657,8 @@ def write_extracted(deps: dict, mapping_dict: dict, options: dict, out_dir: Path
             print(yellow(f"  [skip] {module_id} — source not found"))
             continue
 
-        sanitized = sanitize(info["source"], mapping_dict, options, lang, registry)
+        sanitized = sanitize(info["source"], mapping_dict, options, lang, registry,
+                             source_path=info["path"])
         rel_path  = lang["output_rel_path"](module_id, mapping_dict)
         dest      = out_dir / rel_path
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1528,9 +1923,9 @@ def interactive_reverse():
 
 def interactive_menu():
     print()
-    print(bold("╔══════════════════════════════════════════╗"))
-    print(bold("║  Code Extractor & Sanitizer (Java/React) ║"))
-    print(bold("╚══════════════════════════════════════════╝"))
+    print(bold("╔═════════════════════════════════════════════════╗"))
+    print(bold("║ Code Extractor & Sanitizer (Java/React/Angular) ║"))
+    print(bold("╚═════════════════════════════════════════════════╝"))
     print()
     print("  1. Trace dependencies & extract sanitized files")
     print("  2. Reverse sanitization on generated test files")
@@ -1652,7 +2047,7 @@ def main():
         return
 
     parser = argparse.ArgumentParser(
-        description="Code extractor and sanitizer (Spring Boot Java / React)",
+        description="Code extractor and sanitizer (Spring Boot Java / React / Angular)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1674,6 +2069,12 @@ Examples:
     --out ./extracted \\
     --test-framework vitest
 
+  # Trace and extract (Angular — inferred from conventional Angular suffixes)
+  python code_extractor.py trace \\
+    --entry src/app/orders/order-list.component.ts \\
+    --src src \\
+    --out ./extracted
+
   # Reverse sanitization on generated tests (language read from mapping.json)
   python code_extractor.py reverse \\
     --mapping ./extracted/mapping.json \\
@@ -1685,10 +2086,10 @@ Examples:
     t = sub.add_parser("trace", help="Trace dependencies and extract sanitized files")
     t.add_argument("--entry",          required=True, help="Path to the entry source file")
     t.add_argument("--lang",           choices=list(LANGUAGES), default=None,
-                   help="Project language (default: inferred from --entry extension)")
+                   help="Project language (default: inferred from --entry filename)")
     t.add_argument("--base",           default=None, help="[spring] Base package to trace within (e.g. com.mycompany)")
-    t.add_argument("--alias",          default="@",  help="[react] Path alias that maps to the src root (default: @)")
-    t.add_argument("--src",            default=None, help="Source root directory (default: src/main/java for spring, src for react)")
+    t.add_argument("--alias",          default="@",  help="[react/angular] Path alias that maps to the src root (default: @)")
+    t.add_argument("--src",            default=None, help="Source root directory (default: src/main/java for spring, src for react/angular)")
     t.add_argument("--out",            default="./extracted",   help="Output directory for sanitized files")
     t.add_argument("--mapping",        default=None,            help="Path to mapping.json (optional)")
     t.add_argument("--test-framework", choices=["jest", "vitest"], default="jest",

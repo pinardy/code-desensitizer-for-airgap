@@ -16,3 +16,6 @@ __pycache__/
 
 # Demo / scratch
 demo/
+
+# macOS
+.DS_Store

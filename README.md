@@ -12,6 +12,8 @@ We can utilize online AI coding assistants or agents to generate the test cases 
 
 ***Supported project types: Spring Boot (Java) and React (JavaScript/TypeScript). The general approach can be adapted to other languages and frameworks as well.***
 
+***Angular (TypeScript) is also supported, including external component templates and styles.***
+
 ## Workflow
 
 1. Desensitize relevant on-premise source code with a custom on-premise script
@@ -36,10 +38,15 @@ python code_extractor.py
 # CLI subcommands
 python code_extractor.py trace --entry path/to/MyService.java --base com.mycompany --src src/main/java --out ./extracted
 python code_extractor.py trace --entry src/components/MyWidget.tsx --src src --out ./extracted
+python code_extractor.py trace --entry src/app/widgets/widget.component.ts --lang angular --src src --out ./extracted
 python code_extractor.py reverse --mapping ./extracted/mapping.json --dir ./generated-tests
 ```
 
 The project language is inferred from the entry file's extension (`.java` → Spring Boot, `.js/.jsx/.ts/.tsx` → React) and can be overridden with `--lang spring|react`.
+
+Angular is inferred from conventional Angular filenames such as `.component.ts`, `.service.ts`, `.module.ts`, `.directive.ts`, `.pipe.ts`, `.guard.ts`, `.resolver.ts`, `.interceptor.ts`, and `.routes.ts`. For other Angular `.ts` files, pass `--lang angular` explicitly.
+
+> **Caveat:** some of these conventions (`.service.ts`, `.module.ts`) are also used by NestJS backends, which will therefore be inferred as Angular. Pass `--lang react` (or the appropriate language) to override when tracing a non-Angular TypeScript project.
 
 ### 1. Interactive mode
 
@@ -56,6 +63,8 @@ Then choose one of the following:
 - `3` to exit
 
 The trace flow first asks which project type you are extracting (Spring Boot or React), then adapts its prompts (base package vs. path alias, Javadoc vs. JSDoc, logger vs. `console.*`, and — for React — the test framework for the generated prompt).
+
+Angular appears as a third project type and uses path aliases, JSDoc, and `console.*` handling like other TypeScript projects.
 
 ### 2. Trace and extract
 
@@ -77,15 +86,26 @@ python code_extractor.py trace \
 	--out ./extracted \
 	--mapping mapping.json \
 	--test-framework vitest
+
+# Angular
+python code_extractor.py trace \
+	--entry src/app/features/payroll/payroll-list.component.ts \
+	--lang angular \
+	--src src \
+	--out ./extracted \
+	--mapping mapping.json
 ```
 
 Arguments:
 
 - `--entry`: Path to the entry source file
 - `--lang`: `spring` or `react`, defaulting to inference from the entry file extension
+- `--lang angular`: Select Angular explicitly when its framework cannot be inferred from a conventional filename
 - `--base`: (Spring) Base package to trace within — required for Spring Boot
 - `--alias`: (React) Path alias that maps to the source root, defaulting to `@`
+- `--alias`: (Angular) Path alias that maps to the source root, defaulting to `@`
 - `--src`: Source root directory, defaulting to `src/main/java` (Spring) or `src` (React)
+- `--src`: For Angular, the source root defaults to `src`
 - `--out`: Output directory for sanitized files, defaulting to `./extracted`
 - `--mapping`: Optional `mapping.json` file to reuse existing mappings
 - `--map-package FROM=TO`: Add a package/path mapping inline (repeatable)
@@ -95,6 +115,7 @@ Arguments:
 - `--keep-comments`: Keep comments instead of stripping them
 - `--keep-doc-tags`: Keep `@author` / `@since` Javadoc/JSDoc tags instead of stripping them
 - `--keep-loggers`: Keep logger statements (`log.*` for Java, `console.*` for React) instead of stripping them
+- Angular also uses `--keep-loggers` for `console.*` statements
 - `--mask-strings`: Replace string literals with `STR_n` placeholders (import specifiers are never masked); the originals are recorded in `mapping.json` and restored by `reverse`
 
 > **Changed defaults:** comments, doc tags, and loggers are now stripped by default on the CLI (matching interactive mode). The old `--strip-javadoc` / `--strip-loggers` flags are accepted as no-ops for backward compatibility.
@@ -103,6 +124,7 @@ How dependencies are traced:
 
 - **Spring Boot**: `import` statements that stay within the `--base` package are followed; classes are grouped as controllers/services/models/repositories/utils/enums.
 - **React**: relative imports (`./`, `../`) and alias imports (`@/...`) are resolved with extension inference (`.tsx/.ts/.jsx/.js`) and `index.*` resolution; bare modules (`react`, `axios`, ...) and asset imports (`.css`, `.svg`, ...) are skipped. Modules are grouped as components/hooks/contexts/api/types/utils.
+- **Angular**: TypeScript imports are resolved like React imports. In addition, literal `templateUrl`, `styleUrl`, and `styleUrls` references are followed so external component templates and styles travel with the TypeScript dependency graph. Files are grouped as components/templates/styles/services/modules/routing/directives/pipes/guards/resolvers/interceptors/state/types/utils.
 
 The trace step writes these artifacts into the output directory:
 
@@ -119,6 +141,8 @@ The trace step writes these artifacts into the output directory:
 ### 3. Generate tests externally
 
 Copy the extracted sanitized source files and the generated `CLAUDE_PROMPT.txt` into your online coding assistant or agent of choice. For Spring Boot the prompt asks for JUnit 5 tests with Mockito and AssertJ; for React it asks for Jest or Vitest tests with React Testing Library.
+
+For Angular, the generated prompt asks for Jasmine tests using Angular TestBed and includes referenced component templates and styles in the extraction set.
 
 ### 4. Reverse sanitization
 
@@ -223,6 +247,112 @@ The test is renamed to `features/payroll/components/IngredientList.test.tsx` and
 
 The Spring Boot flow is identical, except the entry file is a `.java` class, `--base com.mycompany` bounds the import tracing, and `package` mappings are Java packages (e.g. `com.classified → com.example`).
 
+## Example walkthrough (Angular)
+
+Suppose the airgapped Angular project contains a sensitive `payroll` feature:
+
+```
+src/
+└── app/payroll/
+    ├── PayrollList.component.ts       # entry
+    ├── PayrollList.component.html     # templateUrl dependency
+    ├── PayrollList.component.scss     # styleUrls dependency
+    ├── Payroll.service.ts
+    ├── PayrollStatus.pipe.ts
+    └── Payroll.model.ts
+```
+
+The component imports its TypeScript dependencies and references its external resources through Angular metadata:
+
+```ts
+@Component({
+  selector: 'app-payroll-list',
+  templateUrl: './PayrollList.component.html',
+  styleUrls: ['./PayrollList.component.scss'],
+})
+export class PayrollListComponent {}
+```
+
+**1. Define Angular path and identifier mappings:**
+
+```json
+{
+  "package":  [{ "from": "app/payroll", "to": "app/feature1" }],
+  "variable": [{ "from": "Payroll", "to": "Widget" }]
+}
+```
+
+The variable mapping covers Angular class names, selectors, template bindings, filenames, and common case variations. For example, `PayrollService`, `payrollStatus`, and `app-payroll-list` become `WidgetService`, `widgetStatus`, and `app-widget-list`.
+
+**2. Preview and extract the Angular feature:**
+
+```bash
+python code_extractor.py trace \
+	--entry src/app/payroll/PayrollList.component.ts \
+	--lang angular \
+	--src src \
+	--out ./extracted \
+	--mapping mapping.json \
+	--dry-run
+
+python code_extractor.py trace \
+	--entry src/app/payroll/PayrollList.component.ts \
+	--lang angular \
+	--src src \
+	--out ./extracted \
+	--mapping mapping.json
+```
+
+`--lang angular` is optional for conventional Angular filenames such as `.component.ts`, but is recommended when the entry file has a generic `.ts` name.
+
+The Angular tracer follows:
+
+- Relative and configured alias TypeScript imports.
+- Barrel exports and literal dynamic imports handled by the TypeScript resolver.
+- Literal `templateUrl`, `styleUrl`, and `styleUrls` references below the source root.
+
+The sanitized output preserves the Angular feature structure:
+
+```
+extracted/
+├── app/feature1/
+│   ├── WidgetList.component.ts
+│   ├── WidgetList.component.html
+│   ├── WidgetList.component.scss
+│   ├── Widget.service.ts
+│   ├── WidgetStatus.pipe.ts
+│   └── Widget.model.ts
+├── CLAUDE_PROMPT.txt                 # Jasmine + Angular TestBed prompt
+├── REVERSE_INSTRUCTIONS.txt
+└── mapping.json                      # keep inside the airgap
+```
+
+Angular TypeScript comments and `console.*` statements follow the same CLI options as other source types. HTML comments and component stylesheet comments are also stripped by default.
+
+When `--mask-strings` is enabled, ordinary TypeScript literals are replaced with reversible `STR_n` placeholders. Angular *structural* strings are kept readable after applying configured mappings, but only when they appear inside a real Angular metadata decorator (`@Component`, `@Directive`, `@Pipe`, `@Injectable`, `@NgModule`) or property decorator (`@Input`, `@Output`, ...). Inside those spans the following are preserved:
+
+- Component selectors.
+- Inline templates and styles (`template`, `styles`, `styleUrls`).
+- `templateUrl`, `styleUrl`, and `styleUrls` paths.
+- Route paths and redirects declared in the decorator.
+- Pipe names, `providedIn`, animation DSL, and common decorator aliases.
+
+This preserves the relationships between the component, template, stylesheet, routes, directives, and pipes for external analysis. The exemptions are deliberately scoped to decorator context: identically shaped keys or calls in ordinary code — `{ name: '...' }`, `db.query('...')`, `cond ? name : '...'` — are masked like any other literal, so masking never fails open on everyday TypeScript.
+
+Note that `--mask-strings` applies only to TypeScript (`.ts`) files. It does **not** apply to `.html` templates or `.css`/`.scss`/`.sass`/`.less`/`.styl` stylesheets at all — literal text and attributes in those files are transformed through explicit mappings rather than blanket string masking, so sensitive free text there is not automatically masked.
+
+**3. Generate Angular tests externally.** Carry out the sanitized Angular files and `CLAUDE_PROMPT.txt`, but keep `mapping.json` inside the airgap. The prompt requests isolated Jasmine tests using Angular TestBed and mocks for injected collaborators.
+
+**4. Restore original terminology inside the airgap:**
+
+```bash
+python code_extractor.py reverse \
+	--mapping ./extracted/mapping.json \
+	--dir ./generated-tests
+```
+
+Angular reversal processes `.ts`, `.html`, `.css`, `.scss`, `.sass`, `.less`, and `.styl` files. It restores content and paths, creates a timestamped backup by default, and writes the same reversal marker used by the other project types.
+
 ## Workflow Summary
 
 1. Run `trace` to extract and sanitize the relevant source code.
@@ -243,6 +373,7 @@ The Spring Boot flow is identical, except the entry file is a `.java` class, `--
 ```
 
 - `package`: boundary-aware substitutions — Java packages like `com.classified → com.example`, or React path segments like `features/payroll → features/feature1`. `com.classified` matches inside `com.classified.service` and `"com.classified"`, but never inside `com.classified2`.
+- For Angular, `package` mappings operate on source-tree path segments such as `app/payroll → app/feature1`.
 - `variable`: name mappings that automatically cover PascalCase, camelCase, snake_case, UPPER_SNAKE, kebab-case, plural/singular, and compound identifiers such as `IngredientService`, `INGREDIENT_TYPE`, or `ingredient-row.tsx`.
 - `strings`: written by `--mask-strings` — maps each `STR_n` placeholder back to the original literal so `reverse` can restore it (in any quote style the generated tests use).
 - Older formats (a bare list, or a dict without `version`/`strings`) still load and are upgraded on save.
@@ -250,6 +381,7 @@ The Spring Boot flow is identical, except the entry file is a `.java` class, `--
 ## Notes
 
 - The extractor traces imports that stay within the provided base package (Spring, dot-bounded so `com.myco` does not capture `com.myco2.*`) or resolve inside the source root (React).
+- Angular TypeScript imports also resolve inside the source root; component metadata adds literal template and stylesheet dependencies.
 - All renames are applied in a single pass: replacements are never re-scanned by other mappings, so sanitize and reverse are idempotent and independent of mapping order. Conflicting mapping sets (duplicates, self-maps, one mapping's output overlapping another's input) are reported as warnings before writing.
 - Names are intentionally replaced inside string literals and comments too — a sensitive name must not survive anywhere in the sanitized output.
 - Older `mapping.json` files without a `language` field are treated as Spring Boot.
@@ -271,4 +403,6 @@ python -m pytest test_code_extractor.py -q
 - **Dynamic imports** with non-literal arguments (`import(someVar)`) cannot be resolved.
 - **CSS/asset files** are skipped entirely — CSS class names and asset filenames are not sanitized (except where they appear as strings in the traced source).
 - **Java text blocks** (`"""..."""`) and char literals are not masked by `--mask-strings`.
+- **Angular structural strings** (`selector`, templates/styles, component resource paths, and route paths) are renamed but intentionally not replaced with `STR_n`; masking them would break the relationships a model needs to analyse. Literal text and attributes in external HTML/stylesheets are also handled by explicit term mappings rather than blanket string masking.
+- **Angular metadata resolution** follows literal component resource paths only. Computed decorator metadata and template-only dependencies introduced indirectly through an NgModule are not discovered unless their TypeScript files are reachable through imports.
 - **Reversal is heuristic**: if an AI-generated test invents an identifier that happens to collide with a mapping's replacement name, `reverse` will rename it too. Use `--dry-run` to preview; a backup is always taken by default.

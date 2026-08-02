@@ -30,6 +30,8 @@ from code_extractor import (
     StringMaskRegistry,
     mask_strings_java,
     mask_strings_react,
+    mask_strings_angular_typescript,
+    strip_comments_stylesheet,
     unmask_strings,
     sanitize,
     load_mappings,
@@ -38,6 +40,7 @@ from code_extractor import (
     write_extracted,
     apply_reversal,
     parse_inline_mappings,
+    infer_language,
     REVERSAL_MARKER,
 )
 
@@ -409,6 +412,145 @@ def test_mask_unmask_react_round_trip():
     assert restored == src
 
 
+def test_mask_angular_preserves_structural_metadata():
+    src = """\
+import { Component } from '@angular/core';
+@Component({
+  selector: 'app-payroll-list',
+  templateUrl: './payroll-list.component.html',
+  styleUrls: ['./payroll-list.component.scss', './theme.scss'],
+})
+export class PayrollListComponent {
+  label = 'Sensitive label';
+}
+"""
+    registry = StringMaskRegistry()
+    masked = mask_strings_angular_typescript(src, registry)
+
+    # Module specifier and @Component metadata are preserved verbatim.
+    assert "'@angular/core'" in masked
+    assert "'app-payroll-list'" in masked
+    assert "'./payroll-list.component.html'" in masked
+    assert "'./payroll-list.component.scss'" in masked
+    assert "'./theme.scss'" in masked
+    # An ordinary string in the class body is masked.
+    assert "Sensitive label" not in masked
+    assert registry.to_dict() == {"STR_0": "'Sensitive label'"}
+
+
+def test_mask_angular_masks_generic_object_keys_outside_decorator():
+    # The key-based exemptions (name/path/redirectTo/...) must NOT fire on
+    # ordinary object literals — otherwise masking fails open on everyday TS.
+    src = """\
+const cfg = { name: 'internal-system-xyz', path: '/etc/secret' };
+const alt = { alias: 'prod', redirectTo: 'internal/route', outlet: 'secret' };
+"""
+    registry = StringMaskRegistry()
+    masked = mask_strings_angular_typescript(src, registry)
+
+    for leaked in ("internal-system-xyz", "/etc/secret", "internal/route",
+                   "secret", "prod"):
+        assert leaked not in masked
+    assert len(registry.to_dict()) == 5
+
+
+def test_mask_angular_masks_generic_calls():
+    # trigger/state/transition/query are only Angular animation DSL inside a
+    # decorator; as bare method calls they must be masked.
+    src = """\
+db.query('SELECT ssn FROM customers');
+machine.state('prod-db-01');
+fsm.transition('to-classified');
+"""
+    registry = StringMaskRegistry()
+    masked = mask_strings_angular_typescript(src, registry)
+
+    for leaked in ("SELECT ssn FROM customers", "prod-db-01", "to-classified"):
+        assert leaked not in masked
+
+
+def test_mask_angular_ternary_does_not_leak():
+    # `... name : 'fallback'` ends in a scalar-key shape but is a ternary,
+    # not decorator metadata — it must be masked.
+    src = "const x = cond ? name : 'fallback-secret-token';\n"
+    registry = StringMaskRegistry()
+    masked = mask_strings_angular_typescript(src, registry)
+
+    assert "fallback-secret-token" not in masked
+
+
+def test_mask_angular_style_key_outside_decorator_fails_closed():
+    # A `styles:` key on a generic object (no decorator) must not exempt the
+    # array contents, and an unrelated secret after it must still be masked.
+    src = """\
+const theme = { styles: ['-----BEGIN PRIVATE KEY-----'] };
+const apiKey = 'sk-live-super-secret';
+"""
+    registry = StringMaskRegistry()
+    masked = mask_strings_angular_typescript(src, registry)
+
+    assert "BEGIN PRIVATE KEY" not in masked
+    assert "sk-live-super-secret" not in masked
+
+
+def test_mask_angular_preserves_animation_dsl_inside_decorator():
+    # Genuine animation metadata inside @Component is structural and preserved.
+    src = """\
+import { Component } from '@angular/core';
+import { trigger, state } from '@angular/animations';
+@Component({
+  selector: 'app-fade',
+  animations: [trigger('fade', [state('active', style({}))])],
+})
+export class FadeComponent { note = 'mask me'; }
+"""
+    registry = StringMaskRegistry()
+    masked = mask_strings_angular_typescript(src, registry)
+
+    assert "'fade'" in masked
+    assert "'active'" in masked
+    assert "mask me" not in masked
+
+
+def test_mask_angular_preserves_inline_template_and_styles():
+    src = """\
+@Component({
+  template: `<p>{{ payroll.name }}</p>`,
+  styles: [`p { color: red; }`, '.payroll { display: block; }'],
+})
+export class PayrollComponent { note = `mask this`; }
+"""
+    registry = StringMaskRegistry()
+    masked = mask_strings_angular_typescript(src, registry)
+
+    assert "`<p>{{ payroll.name }}</p>`" in masked
+    assert "`p { color: red; }`" in masked
+    assert "'.payroll { display: block; }'" in masked
+    assert "mask this" not in masked
+
+
+def test_strip_stylesheet_trailing_line_comment():
+    src = ".widget { color: red; } // comment about internal system\n"
+    stripped = strip_comments_stylesheet(src)
+    assert "internal system" not in stripped
+    assert ".widget" in stripped
+    assert "color: red;" in stripped
+
+
+def test_strip_stylesheet_full_line_comment():
+    src = "// leading note about secret-project\n.widget { color: red; }\n"
+    stripped = strip_comments_stylesheet(src)
+    assert "secret-project" not in stripped
+    assert ".widget" in stripped
+
+
+def test_strip_stylesheet_preserves_url_scheme():
+    # `//` inside an unquoted URL scheme must not be mistaken for a comment.
+    src = ".bg { background: url(http://example.com/img.png); }\n"
+    stripped = strip_comments_stylesheet(src)
+    assert "http://example.com/img.png" in stripped
+
+
 def test_unmask_any_quote_style():
     # AI-generated tests may restyle quotes around the token
     strings = {"STR_0": '"original"'}
@@ -480,6 +622,13 @@ def test_parse_inline_mappings():
         parse_inline_mappings(["no-separator"], "--map-var")
     with pytest.raises(SystemExit):
         parse_inline_mappings(["=empty-from"], "--map-var")
+
+
+def test_infer_language_from_angular_filename():
+    assert infer_language("src/app/users/user-list.component.ts") == "angular"
+    assert infer_language("src/app/users/user.service.ts") == "angular"
+    assert infer_language("src/app/app-routing.module.ts") == "angular"
+    assert infer_language("src/lib/plain-typescript.ts") == "react"
 
 
 # ─────────────────────────────────────────────
@@ -593,6 +742,69 @@ REACT_MAPPING = {
     "strings": {},
 }
 
+ANGULAR_FILES = {
+    "app/payroll/payroll-list.component.ts": """\
+import { Component } from '@angular/core';
+import { PayrollService } from './payroll.service';
+import { PayrollStatusPipe } from './payroll-status.pipe';
+import { Payroll } from './payroll.model';
+
+@Component({
+  selector: 'app-payroll-list',
+  templateUrl: './payroll-list.component.html',
+  styleUrls: ['./payroll-list.component.scss'],
+})
+export class PayrollListComponent {
+  title = 'Payroll administration';
+  payrolls: Payroll[] = [];
+
+  constructor(private payrollService: PayrollService) {
+    console.log('created payroll list');
+  }
+}
+""",
+    "app/payroll/payroll-list.component.html": """\
+<!-- payroll table -->
+<section class="payroll-list">
+  <h1>{{ title }}</h1>
+  <div *ngFor="let payroll of payrolls">{{ payroll.name | payrollStatus }}</div>
+</section>
+""",
+    "app/payroll/payroll-list.component.scss": """\
+/* payroll styles */
+.payroll-list { color: navy; }
+""",
+    "app/payroll/payroll.service.ts": """\
+import { Injectable } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Payroll } from './payroll.model';
+
+@Injectable({ providedIn: 'root' })
+export class PayrollService {
+  private readonly url = '/api/payroll';
+  constructor(private http: HttpClient) {}
+  load() { return this.http.get<Payroll[]>(this.url); }
+}
+""",
+    "app/payroll/payroll-status.pipe.ts": """\
+import { Pipe, PipeTransform } from '@angular/core';
+
+@Pipe({ name: 'payrollStatus' })
+export class PayrollStatusPipe implements PipeTransform {
+  transform(value: string): string { return value; }
+}
+""",
+    "app/payroll/payroll.model.ts": """\
+export interface Payroll { payrollId: string; name: string; }
+""",
+}
+
+ANGULAR_MAPPING = {
+    "package": [{"from": "app/payroll", "to": "app/feature1"}],
+    "variable": [{"from": "Payroll", "to": "Widget"}],
+    "strings": {},
+}
+
 NO_STRIP = {"strip_comments": False, "strip_javadoc": False,
             "mask_strings": False, "strip_loggers": False}
 ALL_STRIP = {k: True for k in NO_STRIP}
@@ -610,6 +822,15 @@ def make_spring_project(tmp_path: Path) -> Path:
 def make_react_project(tmp_path: Path) -> Path:
     src_root = tmp_path / "src"
     for rel, content in REACT_FILES.items():
+        f = src_root / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(content, encoding="utf-8")
+    return src_root
+
+
+def make_angular_project(tmp_path: Path) -> Path:
+    src_root = tmp_path / "src"
+    for rel, content in ANGULAR_FILES.items():
         f = src_root / rel
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(content, encoding="utf-8")
@@ -641,7 +862,8 @@ def assert_fully_sanitized(out_dir: Path, mapping: dict, lang: dict):
         rel = p.relative_to(out_dir).as_posix()
         mapped = str(apply_path_mappings(rel, mapping, lang))
         assert mapped in (rel, rel.replace("/", os.sep)), f"path not fully sanitized: {rel}"
-        if p.suffix in (".java", ".ts", ".tsx", ".js", ".jsx"):
+        if p.suffix in (".java", ".ts", ".tsx", ".js", ".jsx", ".html",
+                        ".css", ".scss", ".sass", ".less", ".styl"):
             content = p.read_text(encoding="utf-8")
             assert apply_all_mappings(content, mapping) == content, \
                 f"content not fully sanitized: {rel}"
@@ -697,11 +919,52 @@ def test_react_trace_and_sanitize(tmp_path):
     assert "${widgets.length}" in content
 
 
+def test_angular_trace_and_sanitize(tmp_path):
+    src_root = make_angular_project(tmp_path)
+    entry = src_root / "app/payroll/payroll-list.component.ts"
+    deps = trace(entry, "@", src_root, LANGUAGES["angular"])
+
+    assert set(deps) == set(ANGULAR_FILES)
+    assert deps["app/payroll/payroll-list.component.html"]["type"] == "template"
+    assert deps["app/payroll/payroll-list.component.scss"]["type"] == "style"
+    assert deps["app/payroll/payroll.service.ts"]["type"] == "service"
+    assert deps["app/payroll/payroll-status.pipe.ts"]["type"] == "pipe"
+
+    out_dir = tmp_path / "extracted"
+    registry = StringMaskRegistry()
+    write_extracted(deps, ANGULAR_MAPPING, ALL_STRIP, out_dir,
+                    LANGUAGES["angular"], registry)
+
+    assert_fully_sanitized(out_dir, ANGULAR_MAPPING, LANGUAGES["angular"])
+    component = out_dir / "app/feature1/widget-list.component.ts"
+    template = out_dir / "app/feature1/widget-list.component.html"
+    stylesheet = out_dir / "app/feature1/widget-list.component.scss"
+    assert component.exists() and template.exists() and stylesheet.exists()
+
+    component_text = component.read_text(encoding="utf-8")
+    assert "selector: 'app-widget-list'" in component_text
+    assert "templateUrl: './widget-list.component.html'" in component_text
+    assert "styleUrls: ['./widget-list.component.scss']" in component_text
+    assert "Payroll administration" not in component_text
+    assert "console.log" not in component_text
+
+    template_text = template.read_text(encoding="utf-8")
+    assert "<!--" not in template_text
+    assert "widgetStatus" in template_text
+    assert "payroll" not in template_text.lower()
+
+    stylesheet_text = stylesheet.read_text(encoding="utf-8")
+    assert "/*" not in stylesheet_text
+    assert ".widget-list" in stylesheet_text
+
+
 @pytest.mark.parametrize("lang_key,builder,entry_rel,scope,mapping", [
     ("spring", make_spring_project, "com/myco/service/OrderService.java", "com.myco",
      SPRING_MAPPING),
     ("react", make_react_project, "features/payroll/PayrollList.tsx", "@",
      REACT_MAPPING),
+    ("angular", make_angular_project, "app/payroll/payroll-list.component.ts", "@",
+     ANGULAR_MAPPING),
 ])
 def test_full_round_trip(tmp_path, lang_key, builder, entry_rel, scope, mapping):
     """sanitize (no strips, masking on) → reverse → byte-identical restoration."""
@@ -846,6 +1109,26 @@ def test_cli_trace_dry_run(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert "Would write" in proc.stdout
+    assert "No files written" in proc.stdout
+    assert not out_dir.exists()
+
+
+def test_cli_angular_trace_dry_run(tmp_path):
+    src_root = make_angular_project(tmp_path)
+    out_dir = tmp_path / "extracted"
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).parent / "code_extractor.py"), "trace",
+         "--entry", str(src_root / "app/payroll/payroll-list.component.ts"),
+         "--src", str(src_root), "--out", str(out_dir),
+         "--map-package", "app/payroll=app/feature1", "--map-var", "Payroll=Widget",
+         "--mask-strings", "--dry-run"],
+        capture_output=True, text=True, encoding="utf-8", env=env, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "Language: Angular (TypeScript)" in proc.stdout
+    assert "widget-list.component.html" in proc.stdout
+    assert "widget-list.component.scss" in proc.stdout
     assert "No files written" in proc.stdout
     assert not out_dir.exists()
 
